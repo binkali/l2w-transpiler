@@ -80,6 +80,138 @@ helper:
     ret
 "#;
 
+/// Calling-convention boundaries: exported functions (called from Windows
+/// code), calls and tail calls to external (Windows) functions with ten
+/// arguments, rsi/rdi clobbering, and gcc -O0 style red-zone use.
+const BRIDGE: &str = r#"
+.intel_syntax noprefix
+.text
+.globl sum10, call_ext10, clobber, rz_add, tail_twice
+.type rz_add, @function
+
+# long sum10(long a1, ..., long a10)
+sum10:
+    lea rax, [rdi + rsi]
+    add rax, rdx
+    add rax, rcx
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp + 8]
+    add rax, qword ptr [rsp + 16]
+    add rax, qword ptr [rsp + 24]
+    add rax, qword ptr [rsp + 32]
+    ret
+
+# long call_ext10(void) = ext_sum10(1, 2, 4, ..., 512) + 7
+call_ext10:
+    push rbx
+    mov rbx, 7                  # callee-saved: must survive the external call
+    sub rsp, 32
+    mov qword ptr [rsp], 64
+    mov qword ptr [rsp + 8], 128
+    mov qword ptr [rsp + 16], 256
+    mov qword ptr [rsp + 24], 512
+    mov edi, 1
+    mov esi, 2
+    mov edx, 4
+    mov ecx, 8
+    mov r8d, 16
+    mov r9d, 32
+    call ext_sum10
+    add rsp, 32
+    add rax, rbx
+    pop rbx
+    ret
+
+# System V allows clobbering rsi/rdi; Windows callers expect them preserved.
+clobber:
+    mov rsi, -1
+    mov rdi, -1
+    mov eax, 7
+    ret
+
+# gcc -O0: int rz_add(int a, int b) { int c = a + b; return c; }  (red zone)
+rz_add:
+    push rbp
+    mov rbp, rsp
+    mov dword ptr [rbp - 20], edi
+    mov dword ptr [rbp - 24], esi
+    mov edx, dword ptr [rbp - 20]
+    mov eax, dword ptr [rbp - 24]
+    add eax, edx
+    mov dword ptr [rbp - 4], eax
+    mov eax, dword ptr [rbp - 4]
+    pop rbp
+    ret
+
+# long tail_twice(long x) = ext_twice(x + 1)   (tail call into Windows code)
+tail_twice:
+    add rdi, 1
+    jmp ext_twice
+"#;
+
+/// Windows-convention implementation of `ext_sum10` used by the translated
+/// build: it scribbles over its shadow space (allowed for a Windows callee;
+/// crashes if the caller did not reserve it) and checks stack alignment.
+const WIN_EXT: &str = r#"
+.intel_syntax noprefix
+.text
+.globl ext_sum10
+ext_sum10:
+    mov qword ptr [rsp + 8], -1
+    mov qword ptr [rsp + 16], -1
+    mov qword ptr [rsp + 24], -1
+    mov qword ptr [rsp + 32], -1
+    mov r10, -1
+    mov r11, -1
+    lea rax, [rcx + rdx]
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp + 40]
+    add rax, qword ptr [rsp + 48]
+    add rax, qword ptr [rsp + 56]
+    add rax, qword ptr [rsp + 64]
+    add rax, qword ptr [rsp + 72]
+    add rax, qword ptr [rsp + 80]
+    test rsp, 15
+    jnz 1f
+    add rax, 1000000            # entry rsp must be 8 mod 16
+1:  ret
+.section .note.GNU-stack,"",@progbits
+"#;
+
+/// Calls `fn` with the Windows convention and reports whether rsi/rdi
+/// survived (bit 0: rsi clobbered, bit 1: rdi clobbered).
+const PROBE: &str = r#"
+.intel_syntax noprefix
+.text
+.globl probe_preserve
+probe_preserve:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    mov r12, rdi
+    mov rsi, 0x1111
+    mov rdi, 0x2222
+    sub rsp, 40
+    call r12
+    add rsp, 40
+    xor eax, eax
+    cmp rsi, 0x1111
+    je 1f
+    or eax, 1
+1:  cmp rdi, 0x2222
+    je 2f
+    or eax, 2
+2:  pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+.section .note.GNU-stack,"",@progbits
+"#;
+
 #[test]
 fn mingw_assembles_translations_without_absolute_32bit_relocations() {
     if !available(MINGW_AS) || !available(MINGW_OBJDUMP) {
@@ -88,7 +220,7 @@ fn mingw_assembles_translations_without_absolute_32bit_relocations() {
         );
         return;
     }
-    for (name, src) in [("library", LIBRARY), ("extra", EXTRA)] {
+    for (name, src) in [("library", LIBRARY), ("extra", EXTRA), ("bridge", BRIDGE)] {
         let asm = translate(src, name);
         let s = dir().join(format!("{name}.win.s"));
         let o = dir().join(format!("{name}.win.o"));
@@ -143,9 +275,23 @@ fn coff_to_elf_sections(asm: &str) -> String {
 
 const HARNESS: &str = r#"
 #include <stdio.h>
-long fib_at(long); long sum_table(void); long bump(long);
-long strlen_l2w(const char *); long max3(long, long, long); int extra(void);
+#ifdef TRANSLATED
+#define ABI __attribute__((ms_abi))   /* translated exports use the Windows convention */
+long probe_preserve(void *fn);
+#else
+#define ABI
+long ext_sum10(long a, long b, long c, long d, long e, long f, long g, long h, long i, long j) {
+    return a + b + c + d + e + f + g + h + i + j;
+}
+#endif
+long ABI ext_twice(long x) { return 2 * x; }
+
+long ABI fib_at(long); long ABI sum_table(void); long ABI bump(long);
+long ABI strlen_l2w(const char *); long ABI max3(long, long, long); int ABI extra(void);
+long ABI sum10(long, long, long, long, long, long, long, long, long, long);
+long ABI call_ext10(void); long ABI clobber(void); int ABI rz_add(int, int); long ABI tail_twice(long);
 extern long counter; extern char shared[128]; extern void *ptrs[2];
+
 int main(void) {
     for (long i = -2; i < 10; i++) printf("%ld ", fib_at(i));
     printf("\n%ld\n", sum_table());
@@ -156,6 +302,14 @@ int main(void) {
     printf("%s\n", (const char *)ptrs[1]);
     shared[127] = 42; printf("%d\n", shared[127]);
     printf("%d\n", extra());
+    printf("sum10 %ld\n", sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+    printf("call_ext10 %ld\n", call_ext10());
+    printf("clobber %ld\n", clobber());
+    printf("rz_add %d\n", rz_add(40, 2));
+    printf("tail_twice %ld\n", tail_twice(20));
+#ifdef TRANSLATED
+    printf("preserve %ld\n", probe_preserve((void *)clobber));
+#endif
     return 0;
 }
 "#;
@@ -169,32 +323,64 @@ fn translated_code_behaves_like_the_original() {
     let d = dir();
     let harness = d.join("harness.c");
     std::fs::write(&harness, HARNESS).unwrap();
-    let build_and_run = |tag: &str, lib: &str, extra: &str| -> String {
-        let lib_s = d.join(format!("{tag}-library.s"));
-        let extra_s = d.join(format!("{tag}-extra.s"));
+    let build_and_run = |tag: &str, translated: bool, sources: &[(&str, String)]| -> String {
         let exe = d.join(format!("{tag}-test"));
-        std::fs::write(&lib_s, lib).unwrap();
-        std::fs::write(&extra_s, extra).unwrap();
+        let mut cmd = Command::new("gcc");
         // -no-pie: the original Linux code uses 32-bit absolute addresses.
-        run(Command::new("gcc")
-            .args(["-no-pie", "-o"])
-            .arg(&exe)
-            .arg(&harness)
-            .arg(&lib_s)
-            .arg(&extra_s));
+        cmd.args(["-no-pie", "-o"]).arg(&exe).arg(&harness);
+        if translated {
+            cmd.arg("-DTRANSLATED");
+        }
+        for (name, src) in sources {
+            let path = d.join(format!("{tag}-{name}.s"));
+            std::fs::write(&path, src).unwrap();
+            cmd.arg(path);
+        }
+        run(&mut cmd);
         run(&mut Command::new(&exe))
     };
-    let original = build_and_run("orig", LIBRARY, EXTRA);
+    let original = build_and_run(
+        "orig",
+        false,
+        &[
+            ("library", LIBRARY.into()),
+            ("extra", EXTRA.into()),
+            ("bridge", BRIDGE.into()),
+        ],
+    );
+    let tr = |src: &str, name: &str| coff_to_elf_sections(&translate(src, name));
     let translated = build_and_run(
         "translated",
-        &coff_to_elf_sections(&translate(LIBRARY, "library")),
-        &coff_to_elf_sections(&translate(EXTRA, "extra")),
+        true,
+        &[
+            ("library", tr(LIBRARY, "library")),
+            ("extra", tr(EXTRA, "extra")),
+            ("bridge", tr(BRIDGE, "bridge")),
+            ("win_ext", WIN_EXT.into()),
+            ("probe", PROBE.into()),
+        ],
     );
+    // rsi/rdi must survive a Windows-convention call into translated code.
+    assert!(translated.contains("preserve 0\n"), "{translated}");
+    let translated: String = translated
+        .lines()
+        .filter(|l| !l.starts_with("preserve"))
+        .map(|l| format!("{l}\n"))
+        .collect();
     assert_eq!(original, translated);
-    assert!(
-        original.contains("-1 -1 1 1 2 3 5 8 13 21 -1 -1"),
-        "{original}"
-    );
-    assert!(original.contains("5 12 12"), "{original}");
-    assert!(original.contains("Hello from l2w"), "{original}");
+    for expected in [
+        "-1 -1 1 1 2 3 5 8 13 21 -1 -1",
+        "5 12 12",
+        "Hello from l2w",
+        "sum10 55\n",
+        "call_ext10 1030\n",
+        "clobber 7\n",
+        "rz_add 42\n",
+        "tail_twice 42\n",
+    ] {
+        assert!(
+            original.contains(expected),
+            "missing {expected:?}:\n{original}"
+        );
+    }
 }
