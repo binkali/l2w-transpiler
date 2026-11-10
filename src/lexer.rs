@@ -136,6 +136,30 @@ pub fn tokenize(src: &str) -> LexOutput {
     }
 }
 
+/// Register names known to GNU as (x86-64) that `l2w` does not support.
+/// They must not be mistaken for symbols: GAS would treat them as registers.
+fn is_reserved_register(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let numbered = |prefix: &str, max: u32| {
+        t.strip_prefix(prefix)
+            .and_then(|n| {
+                n.parse::<u32>()
+                    .ok()
+                    .filter(|v| *v <= max && n == v.to_string())
+            })
+            .is_some()
+    };
+    t == "st"
+        || numbered("mm", 7)
+        || numbered("tmm", 7)
+        || numbered("k", 7)
+        || numbered("xmm", 31)
+        || numbered("ymm", 31)
+        || numbered("zmm", 31)
+        || numbered("cr", 15)
+        || numbered("dr", 15)
+}
+
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || matches!(c, '_' | '.' | '@')
 }
@@ -349,14 +373,24 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let text = &self.src[m.pos..self.pos];
-        let kind =
-            if text.starts_with('.') && self.stmt_len == 0 && !self.next_nonblank_is(&[':', '=']) {
-                TokenKind::Directive(text.to_ascii_lowercase())
-            } else if let Some(reg) = Register::parse(text) {
-                TokenKind::Register(reg)
-            } else {
-                TokenKind::Ident(text.to_string())
-            };
+        let kind = if text.starts_with('.')
+            && self.stmt_len == 0
+            && !self.next_nonblank_is(&[':', '='])
+        {
+            TokenKind::Directive(text.to_ascii_lowercase())
+        } else if let Some(reg) = Register::parse(text) {
+            TokenKind::Register(reg)
+        } else if is_reserved_register(text) {
+            let span = self.span_from(m);
+            self.diagnostics.push(
+                    Diagnostic::error(format!("register `{text}` is not supported"), span).with_help(
+                        "GNU as reserves this name for a register (x87/MMX/AVX/AVX-512/control/debug), so it cannot be used as a symbol either",
+                    ),
+                );
+            TokenKind::Ident(text.to_string())
+        } else {
+            TokenKind::Ident(text.to_string())
+        };
         self.push(kind, m);
     }
 
@@ -700,6 +734,26 @@ mod tests {
             msgs[3].starts_with("4:11: error: unexpected character `?`"),
             "{msgs:?}"
         );
+    }
+
+    #[test]
+    fn reserved_register_names() {
+        for name in [
+            "k1", "ymm0", "zmm31", "xmm16", "mm7", "st", "cr0", "dr7", "tmm3",
+        ] {
+            let out = tokenize(&format!("mov rax, {name}"));
+            assert!(
+                out.diagnostics[0].message.contains("is not supported"),
+                "{name}: {:?}",
+                out.diagnostics
+            );
+        }
+        for name in ["k8", "kx", "mm8", "cr0x", "st0", "k01"] {
+            assert!(
+                tokenize(&format!("mov rax, {name}")).diagnostics.is_empty(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

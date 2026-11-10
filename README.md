@@ -19,14 +19,15 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 | Phase | Content | Status |
 |---|---|---|
 | 1 | Rust project, CLI, lexer, parser, diagnostics | ✅ done |
-| 2 | AST → intermediate representation | ⏳ planned |
+| 2 | AST → intermediate representation, semantic validation, analysis | ✅ done |
 | 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ⏳ planned |
 | 4 | Calling-convention compatibility (System V ↔ Windows x64) | ⏳ planned |
 | 5 | Linux system calls → Windows API runtime layer | ⏳ planned |
 | 6 | Windows code generation, cross-compiling with MinGW-w64 | ⏳ planned |
 | 7 | More tests, error handling, documentation | ⏳ planned |
 
-Right now, `--check`, `--dump-tokens` and `--dump-ast` are fully working.
+Right now, `--check` (parser **and** IR validation), `--dump-tokens`, `--dump-ast` and
+`--dump-ir` are fully working.
 Translating (`-o`) and `--compile` stop with a clear "not implemented yet" error
 until phases 3 and 6 are done.
 
@@ -49,6 +50,7 @@ l2w input.s --check                        # parse/analyze only, report diagnost
 l2w input.s --check --verbose              # with progress information
 l2w input.s --dump-tokens                  # print the lexer's token stream
 l2w input.s --dump-ast                     # print the parsed AST
+l2w input.s --dump-ir                      # print IR analysis + normalized listing
 ```
 
 Exit codes: `0` success, `1` errors in the input, `2` usage or I/O error.
@@ -88,7 +90,9 @@ src/
 ├── parser.rs                recursive-descent parser → AST
 ├── ast.rs                   AST types + normalized pretty-printer
 ├── diagnostics.rs           spans, errors/warnings, rustc-style rendering
-├── ir.rs                    intermediate representation            (phase 2)
+├── ir.rs                    IR types + normalized listing printer
+├── ir/lower.rs              AST → IR: semantics, validation, sizes
+├── ir/analysis.rs           functions, calls, syscalls, register values
 ├── transpiler.rs            Linux → Windows passes                 (phases 3–5)
 ├── codegen/{mod,windows}.rs Windows/COFF GAS emitter               (phase 6)
 ├── compatibility/
@@ -98,8 +102,8 @@ src/
 └── linker.rs                MinGW-w64 assembler/linker driver      (phase 6)
 tests/
 ├── cli.rs                   end-to-end tests of the binary
-└── roundtrip.rs             parse → print → `as` object comparison
-examples/                    sample programs (hello, loop, functions, errors)
+└── roundtrip.rs             AST/IR → listing → `as` object comparison
+examples/                    sample programs (hello, loop, functions, errors, errors_semantic)
 ```
 
 ## Supported input (phase 1)
@@ -173,6 +177,79 @@ can't be subtracted.
 The parser handles assembly produced by `gcc -S -masm=intel` (`-O0`/`-O2`),
 including quoted symbol names.
 
+## Intermediate representation (phase 2)
+
+`ir::lower` turns the AST into an `ir::Module`. The module has two separate layers:
+
+| Layer | Contents |
+|---|---|
+| **Architecture** | `Section`s (ELF name, classified as code / data / bss / read-only / note) holding `Item`s: labels, validated `Instr`s, data (`Values`, `Bytes`, `Fill`), `Align` (normalized to bytes), `Set` (equates, kept in place because `.` depends on position), `Common`. `Chunk`s keep the original order in which sections were entered. |
+| **Symbols / structure** | `SymbolTable` (labels, equates with value class, commons, undefined = external; `.globl`, `.extern`, `.type`, `.size`), `Function`s |
+| **Platform (Linux/ELF)** | entry point (`_start` → raw, `main` → C runtime), **syscall sites** with statically known register values, **call sites** (internal / external / indirect), externals, ELF relocation modifiers (`@PLT`, `@GOTPCREL`), `fs:`/`gs:` accesses, number of dropped metadata directives |
+
+### Operand semantics (exactly as GNU as decides them)
+
+I checked each of these rules against GNU as.
+
+| Source | IR |
+|---|---|
+| `jmp L`, `jne 1b`, `call f` | `Target` |
+| `5`, `'A'`, `mov rdx, len` where `len` is an **absolute equate defined earlier** | `Imm` |
+| `offset len` (absolute equate, defined anywhere) | `Imm` |
+| `offset msg` (address) | `Addr` |
+| `mov rax, msg` (bare symbol) | `Mem` (absolute `[msg]`) |
+| `mov rdx, len` where `len` is defined **later** | `Mem` + **warning**. GAS really does turn this into a memory read from address `len`. |
+
+When the listing is printed, symbolic immediates get `offset` (`mov rdx, offset len`). That
+way they stay immediates however the code is reordered later. GAS produces the identical
+encoding for both forms.
+
+### Validation
+
+- **Instructions:** `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop leave nop syscall`.
+  All `jcc` aliases are accepted and normalized (`jz` → `je`, `jnle` → `jg`, …). Anything
+  else is an error (`unsupported instruction`), with line, column and the list of supported
+  instructions.
+- **Operand forms**, per instruction: arity; register/memory/immediate allowed or not; no
+  memory-to-memory operands; `lea` needs memory; `jcc` needs a label; shift count must be an
+  immediate or `cl`; `movzx`/`movsx` source sizes; `push`/`pop` only 64/16-bit.
+- **Operand sizes:** inferred from registers (`mov [rbx], ecx` → `dword ptr`); conflicts
+  (`mov rax, ebx`) and ambiguous sizes (`inc [rdi]`, `mov [rax], 1`) are errors.
+  `push`/`pop`/`jmp`/`call [mem]` default to `qword`, `movsxd` to `dword`, just like GAS.
+- **Immediates:** range-checked per operand size. 64-bit operations take only
+  sign-extended imm32 (`add rax, 0xFFFFFFFF` → error); `mov r64, imm64` is allowed. Equate
+  values are evaluated where possible (`k = 300` / `mov bl, k` → error).
+- **Encoding limits:** `ah/bh/ch/dh` with REX registers; `lock` only for read-modify-write
+  instructions with a memory destination.
+- **Symbols and data:** duplicate definitions, self-referencing equates, initialized data in
+  `.bss`, alignment that isn't a power of two, data that doesn't fit (warning).
+- **Numeric labels** (`1:` / `1b` / `1f`) are resolved to unique `.Ll2w_<n>_<k>` labels; a
+  missing target is an error.
+- **Reserved register names:** GAS reserves `k0–k7`, `st`, `mm*`, `tmm*`, `xmm16+`,
+  `ymm*`, `zmm*`, `cr*`, `dr*`. Using one as a symbol is an error, because GAS would read it
+  as a register.
+
+### Analysis
+
+- **Functions:** a label in a code section starts a function if it is the entry point, has
+  `.type @function`, is global, or is the target of a direct `call`. It runs until the next
+  function label. Local labels such as `.Lloop` stay inside the function.
+- **Register values at `syscall`:** a conservative backward scan within the basic block. It
+  understands `mov` (immediate, `offset`, copying from a register, 32-bit zero-extension),
+  `xor/sub reg, reg`, `lea [rip + sym]`, and `add/sub/inc/dec` with constants. It stops at
+  labels, `call`, `jmp`/`ret` and partial (8/16-bit) writes. Across a `syscall`, only `rax`,
+  `rcx` and `r11` are treated as clobbered; on the fall-through path of a `jcc`, earlier
+  values stay valid.
+
+```text
+$ l2w examples/hello.s --dump-ir
+...
+platform (linux/elf):
+  entry: _start (Start)
+  syscall line 15   rax=1 (write) rdi=1 rsi=&msg rdx=len in _start
+  syscall line 19   rax=60 (exit) rdi=0 rsi=&msg rdx=len in _start
+```
+
 ### Not supported (yet)
 
 - AT&T syntax and `.intel_syntax prefix` (`%rax`)
@@ -180,6 +257,8 @@ including quoted symbol names.
 - Subsections, `.weak`, `.pushsection`/`.popsection`
 - Floating-point literals
 - `ymm`/`zmm`, mask and control registers
+- SSE/AVX, string instructions (`movs`, `stos`, `rep`), `setcc`/`cmovcc`, `movabs`,
+  `.set` redefinition, and `.lcomm` with an alignment argument (GAS/ELF doesn't accept it)
 
 ## Tests
 
@@ -191,10 +270,14 @@ cargo test
   rendering.
 - **`tests/cli.rs`** runs the binary end to end: `--check`, `--verbose`, dumps,
   exit codes, and error positions.
-- **`tests/roundtrip.rs`** is a semantic check. It parses the input, prints it back
-  as normalized assembly, assembles **both** versions with GNU `as`, and requires
-  identical object contents and relocations. This shows the parser and printer keep
-  the meaning of the code. The test is skipped if `as`/`objdump` aren't installed.
+- **`tests/roundtrip.rs`** is a semantic check in two stages:
+  1. AST → printed source;
+  2. AST → **IR** → normalized listing.
+
+  For each stage, GNU `as` assembles **both** the original and the generated text, and the
+  object contents and relocations must be identical. This shows that the IR's operand
+  semantics (memory vs. immediate, inferred sizes, equate order, numeric labels, `offset`)
+  match GAS exactly. The test is skipped if `as`/`objdump` aren't installed.
 
 ## Planned translation rules (outline for later phases)
 
