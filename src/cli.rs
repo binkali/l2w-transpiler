@@ -28,6 +28,7 @@ OPTIONS:
         --check             Only parse and analyze the input, report diagnostics
         --dump-tokens       Print the lexer token stream
         --dump-ast          Print the parsed AST (debug format)
+        --dump-ir           Print the IR analysis and normalized listing
     -v, --verbose           Print progress information to stderr
     -h, --help              Print this help
     -V, --version           Print version
@@ -56,6 +57,7 @@ pub enum Mode {
     Check,
     DumpTokens,
     DumpAst,
+    DumpIr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +140,7 @@ where
             "--check" => modes.push((Mode::Check, "--check")),
             "--dump-tokens" => modes.push((Mode::DumpTokens, "--dump-tokens")),
             "--dump-ast" => modes.push((Mode::DumpAst, "--dump-ast")),
+            "--dump-ir" => modes.push((Mode::DumpIr, "--dump-ir")),
             "-v" | "--verbose" => verbose = true,
             "-" => return err("reading from stdin is not supported; pass a file path"),
             f if f.starts_with('-') => {
@@ -163,8 +166,12 @@ where
         return err(format!("conflicting options: {}", names.join(", ")));
     }
     let mode = modes.first().map_or(Mode::Transpile, |(m, _)| *m);
-    if matches!(mode, Mode::Check | Mode::DumpTokens | Mode::DumpAst) && output.is_some() {
-        return err("`-o` cannot be combined with --check, --dump-tokens or --dump-ast");
+    let inspect_only = matches!(
+        mode,
+        Mode::Check | Mode::DumpTokens | Mode::DumpAst | Mode::DumpIr
+    );
+    if inspect_only && output.is_some() {
+        return err("`-o` cannot be combined with --check or --dump-*");
     }
     let output = match (mode, output) {
         (Mode::Compile, None) => Some(input.with_extension("exe")),

@@ -54,6 +54,8 @@ fn verbose_prints_statistics() {
     assert!(o.status.success());
     let e = stderr(&o);
     assert!(e.contains("[l2w] lexed"), "{e}");
+    assert!(e.contains("IR: 2 sections"), "{e}");
+    assert!(e.contains("2 syscalls"), "{e}");
     assert!(e.contains("8 instructions, 2 labels, 6 directives"), "{e}");
 }
 
@@ -111,4 +113,50 @@ fn lexer_errors_are_reported() {
     assert!(e.contains("unterminated string literal"), "{e}");
     assert!(e.contains("lexerr.s:1:10"), "{e}");
     assert!(e.contains("unexpected `$`"), "{e}");
+}
+
+#[test]
+fn check_reports_semantic_errors() {
+    let o = l2w(&["examples/errors_semantic.s", "--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let e = stderr(&o);
+    for (msg, loc) in [
+        (
+            "operand size mismatch for `mov`: `rax` is 64-bit, but `ebx` is 32-bit",
+            "errors_semantic.s:6:14",
+        ),
+        ("ambiguous operand size for `inc`", "errors_semantic.s:7:5"),
+        (
+            "does not fit in a sign-extended 32-bit immediate",
+            "errors_semantic.s:8:14",
+        ),
+        ("unsupported instruction `cpuid`", "errors_semantic.s:9:5"),
+        (
+            "no local label `1:` before this reference",
+            "errors_semantic.s:10:5",
+        ),
+        ("`len` is defined after this use", "errors_semantic.s:11:14"),
+    ] {
+        assert!(e.contains(msg), "missing `{msg}` in:\n{e}");
+        assert!(e.contains(loc), "missing `{loc}` in:\n{e}");
+    }
+    assert!(e.contains("aborting due to 5 errors"), "{e}");
+}
+
+#[test]
+fn dump_ir_shows_analysis_and_listing() {
+    let o = l2w(&["examples/hello.s", "--dump-ir"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("entry: _start (Start)"), "{out}");
+    assert!(
+        out.contains("rax=1 (write) rdi=1 rsi=&msg rdx=len"),
+        "{out}"
+    );
+    assert!(out.contains("rax=60 (exit) rdi=0"), "{out}");
+    assert!(
+        out.contains("len                  equate (absolute) = . - msg"),
+        "{out}"
+    );
+    assert!(out.contains("    mov rdx, offset len"), "{out}");
 }

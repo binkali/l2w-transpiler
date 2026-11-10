@@ -837,7 +837,15 @@ impl<'a> Parser<'a> {
                 let symbol = self.symbol_name()?;
                 self.expect(&TokenKind::Comma, &format!("after symbol in `{name}`"))?;
                 let size = self.expr()?;
-                let align = if self.eat(&TokenKind::Comma) {
+                let align = if self.peek() == &TokenKind::Comma {
+                    if name == ".lcomm" {
+                        return Err(Diagnostic::error(
+                            "`.lcomm` takes no alignment argument for ELF targets",
+                            self.span(),
+                        )
+                        .with_help("use `.local sym` followed by `.comm sym, size, align`"));
+                    }
+                    self.bump();
                     Some(self.expr()?)
                 } else {
                     None

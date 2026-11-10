@@ -1,6 +1,6 @@
 use l2w::cli::{self, Command, Mode, Options};
 use l2w::diagnostics::{Diagnostic, SourceFile};
-use l2w::{ast::StatementKind, lexer, parser};
+use l2w::{ast::StatementKind, ir, lexer, parser};
 use std::process::ExitCode;
 
 /// Exit codes: 0 = success, 1 = errors in the input, 2 = usage or I/O error.
@@ -76,9 +76,34 @@ fn run(opts: &Options) -> ExitCode {
         return status;
     }
 
+    if opts.mode == Mode::DumpAst {
+        println!("{:#?}", parsed.program);
+        return ExitCode::SUCCESS;
+    }
+
+    let lowered = ir::lower(&parsed.program);
+    if opts.verbose {
+        let m = &lowered.module;
+        verbose(&format!(
+            "IR: {} sections, {} symbols, {} functions, {} calls, {} syscalls, {} externals",
+            m.sections.len(),
+            m.symbols.len(),
+            m.functions.len(),
+            m.platform.calls.len(),
+            m.platform.syscalls.len(),
+            m.platform.externals.len()
+        ));
+    }
+    let status = report(&file, &lowered.diagnostics);
+    if lowered.has_errors() {
+        return status;
+    }
+
     match opts.mode {
-        Mode::DumpAst => {
-            println!("{:#?}", parsed.program);
+        Mode::DumpIr => {
+            println!("{}", lowered.module.summary());
+            println!("# normalized listing");
+            print!("{}", lowered.module);
             ExitCode::SUCCESS
         }
         Mode::Check => {
@@ -89,11 +114,11 @@ fn run(opts: &Options) -> ExitCode {
             let d = Diagnostic::global_error(
                 "translation to Windows assembly is not implemented yet (planned for phase 3)",
             )
-            .with_help("use `--check` or `--dump-ast` to validate the input");
+            .with_help("use `--check` or `--dump-ir` to validate and inspect the input");
             eprint!("{}", d.render(&file));
             ExitCode::from(EXIT_INPUT_ERROR)
         }
-        Mode::DumpTokens => unreachable!(),
+        Mode::DumpTokens | Mode::DumpAst => unreachable!(),
     }
 }
 
