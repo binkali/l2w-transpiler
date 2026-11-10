@@ -418,7 +418,8 @@ fn spec_05_exit() {
 
 // -- 6 ------------------------------------------------------------------------
 
-/// External C functions (compiled ms_abi for the translated build). The
+/// External C functions (compiled ms_abi for the translated build; `int64_t`
+/// because `long` is 32-bit on Windows). The
 /// weights detect swapped or shifted arguments; `CHECK` makes a misaligned
 /// call visible as a wrong result.
 const EXT_FUNCTIONS: &str = r#"
@@ -427,18 +428,18 @@ const EXT_FUNCTIONS: &str = r#"
 #else
 #define CHECK
 #endif
-long ABI ext0(void) { CHECK; return 7; }
-long ABI ext1(long a) { CHECK; return a; }
-long ABI ext2(long a, long b) { CHECK; return a + 2 * b; }
-long ABI ext4(long a, long b, long c, long d) { CHECK; return a + 2 * b + 3 * c + 4 * d; }
-long ABI ext5(long a, long b, long c, long d, long e) { CHECK; return a + 2 * b + 3 * c + 4 * d + 5 * e; }
-long ABI ext6(long a, long b, long c, long d, long e, long f) {
+int64_t ABI ext0(void) { CHECK; return 7; }
+int64_t ABI ext1(int64_t a) { CHECK; return a; }
+int64_t ABI ext2(int64_t a, int64_t b) { CHECK; return a + 2 * b; }
+int64_t ABI ext4(int64_t a, int64_t b, int64_t c, int64_t d) { CHECK; return a + 2 * b + 3 * c + 4 * d; }
+int64_t ABI ext5(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e) { CHECK; return a + 2 * b + 3 * c + 4 * d + 5 * e; }
+int64_t ABI ext6(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f) {
     CHECK; return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f;
 }
-long ABI ext7(long a, long b, long c, long d, long e, long f, long g) {
+int64_t ABI ext7(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f, int64_t g) {
     CHECK; return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g;
 }
-long ABI ext10(long a, long b, long c, long d, long e, long f, long g, long h, long i, long j) {
+int64_t ABI ext10(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f, int64_t g, int64_t h, int64_t i, int64_t j) {
     CHECK; return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h + 9 * i + 10 * j;
 }
 int ABI ext_int(int a, int b) { CHECK; return a * b; }
@@ -810,11 +811,11 @@ const SHADOW_FUNCTIONS: &str = r#"
 #else
 #define CHECK
 #endif
-long ABI scribble(long a, long b, long c, long d, long e) {
+int64_t ABI scribble(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e) {
     CHECK;
-    long r = a + 2 * b + 3 * c + 4 * d + 5 * e;
+    int64_t r = a + 2 * b + 3 * c + 4 * d + 5 * e;
 #ifdef WIN
-    volatile long *home = (long *)__builtin_frame_address(0) + 2;
+    volatile int64_t *home = (int64_t *)__builtin_frame_address(0) + 2;
     home[0] = home[1] = home[2] = home[3] = -1;
 #endif
     return r;
