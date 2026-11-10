@@ -22,16 +22,17 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 | 2 | AST → intermediate representation, semantic validation, analysis | ✅ done |
 | 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ✅ done |
 | 4 | Calling-convention compatibility (System V ↔ Windows x64) | ✅ done |
-| 5 | Linux system calls → Windows API runtime layer | ⏳ planned |
+| 5 | Linux system calls → Windows API runtime layer | ✅ done |
 | 6 | Windows code generation, cross-compiling with MinGW-w64 | ⏳ planned |
 | 7 | More tests, error handling, documentation | ⏳ planned |
 
 Right now, translation (`-o`), `--check` (parsing, IR validation and checking that the
 code can be translated to Windows), `--dump-tokens`, `--dump-ast` and `--dump-ir` all work.
 Calls to external (Windows/CRT) functions and Windows calls into the program (`main`,
-exported functions) are bridged. Programs that contain Linux **system calls** (phase 5) are
-still rejected, with an error at each such line. `--compile` follows in phase 6; until then
-you can link by hand: `x86_64-w64-mingw32-gcc out.s -o out.exe`.
+exported functions) are bridged, and Linux **system calls** are implemented on top of the
+Win32 API. `--compile` follows in phase 6. Until then you can link by hand:
+`x86_64-w64-mingw32-gcc out.s -o out.exe` for programs with `main`, or
+`x86_64-w64-mingw32-gcc -nostdlib -e _start out.s -lkernel32 -o out.exe` for `_start` programs.
 Translating (`-o`) and `--compile` stop with a clear "not implemented yet" error
 until phases 3 and 6 are done.
 
@@ -99,9 +100,10 @@ src/
 ├── ir/analysis.rs           functions, calls, syscalls, register values
 ├── transpiler.rs            Linux → Windows passes (sections, addressing, data)
 ├── transpiler/bridge.rs     calling-convention bridging pass
+├── transpiler/syscalls.rs   system call translation pass
 ├── codegen/{mod,windows}.rs Windows/COFF GAS emitter
 ├── compatibility/
-│   ├── syscalls.rs          Linux syscalls → Win32 API             (phase 5)
+│   ├── syscalls.rs          Linux syscalls → Win32 API shims, fd table
 │   ├── calling_convention.rs System V ↔ Windows x64 ABI, thunks, wrappers
 │   └── directives.rs        ELF → COFF section mapping
 └── linker.rs                MinGW-w64 assembler/linker driver      (phase 6)
@@ -333,7 +335,7 @@ Constants stay constants (`mov rdx, offset len` for an absolute equate).
 | red zone | 128 bytes below rsp | none |
 | alignment before `call` | rsp ≡ 0 (mod 16) | rsp ≡ 0 (mod 16) |
 | callee-saved | rbx, rbp, r12–r15 | rbx, rbp, **rsi, rdi**, r12–r15, **xmm6–15** |
-| system calls | `syscall`, rax = number, args in rdi, rsi, rdx, **r10**, r8, r9 | not a stable ABI → Win32 API (phase 5) |
+| system calls | `syscall`, rax = number, args in rdi, rsi, rdx, **r10**, r8, r9 | not a stable ABI → Win32 API (see below) |
 
 ### Strategy: System V inside, bridges at the boundaries
 
@@ -393,6 +395,87 @@ All outputs must match the original build. A deliberately broken thunk (no shado
 caught by the test. On top of that, gcc `-O0` output that uses `printf` can be translated
 and linked with `x86_64-w64-mingw32-gcc` into a working `PE32+` executable.
 
+## System calls (phase 5)
+
+Windows has no stable system-call interface. `l2w` replaces every `syscall` with a call to a
+**shim** that implements the Linux call using the Win32 API (kernel32 only, no C runtime):
+
+| Linux | rax | Win32 |
+|---|---|---|
+| `read(fd, buf, count)` | 0 | `ReadFile` |
+| `write(fd, buf, count)` | 1 | `WriteFile` (+ `SetFilePointerEx` for `O_APPEND`) |
+| `open(path, flags, mode)` | 2 | `CreateFileA` |
+| `close(fd)` | 3 | `CloseHandle` |
+| `getpid()` | 39 | `GetCurrentProcessId` |
+| `exit(status)`, `exit_group(status)` | 60, 231 | `ExitProcess(status & 0xff)` |
+
+The system call number must be **statically known**. `l2w` tracks register values backwards
+within the basic block (`mov eax, 1` … `syscall`). An unknown or unsupported number is an
+**error** at the `syscall` line, which lists the supported calls. Statically known `open`
+flags that can't be translated (e.g. `O_DIRECTORY`, `O_NONBLOCK`) are also an error; unknown
+flags are checked at run time (`-EINVAL`).
+
+### The shim contract: exactly like `syscall`
+
+```asm
+    lea rsp, [rsp - 128]        # skip the System V red zone (lea keeps the flags)
+    call __l2w_sys_write
+    lea rsp, [rsp + 128]
+```
+
+- Arguments in rdi, rsi, rdx; result in rax as a value or `-errno`.
+- **All other registers and RFLAGS are preserved**, as with Linux `syscall`. Only rcx and
+  r11 are clobbered. The shims save rdx, r8–r10 (volatile on Windows) and RFLAGS
+  (`pushfq`/`popfq`). rsi/rdi are preserved by Windows itself.
+- Data below rsp (red zone) stays untouched. The shim aligns the stack to 16 bytes and
+  reserves shadow space and stack arguments.
+
+### File descriptors and errors
+
+- A table maps Linux fds (0–255) to Windows `HANDLE`s with flags. fds 0/1/2 are
+  `GetStdHandle(STD_INPUT/OUTPUT/ERROR_HANDLE)`, fetched on first use.
+- `open` returns the **lowest free fd**, like Linux (the first file is 3). Flags map to
+  access (`GENERIC_READ`/`WRITE`) and disposition: `O_CREAT|O_EXCL` → `CREATE_NEW`,
+  `O_CREAT|O_TRUNC` → `CREATE_ALWAYS`, `O_CREAT` → `OPEN_ALWAYS`, `O_TRUNC` →
+  `TRUNCATE_EXISTING`, otherwise `OPEN_EXISTING`. Sharing is `READ|WRITE|DELETE`, since
+  Linux has no mandatory locks. With `O_CREAT`, a `mode` without owner write permission
+  gives `FILE_ATTRIBUTE_READONLY`.
+- `O_APPEND`: every `write` seeks to the end first.
+- `read` on a write-only fd, `write` on a read-only fd, and any access to a closed or
+  invalid fd → `-EBADF`, like Linux.
+- Win32 errors (`GetLastError`) → `-errno`: `ERROR_FILE_NOT_FOUND`/`PATH_NOT_FOUND` →
+  `ENOENT`, `ACCESS_DENIED` → `EACCES`, `INVALID_HANDLE` → `EBADF`,
+  `FILE_EXISTS`/`ALREADY_EXISTS` → `EEXIST`, `TOO_MANY_OPEN_FILES` → `EMFILE`,
+  `INVALID_PARAMETER`/`INVALID_NAME` → `EINVAL`, `BROKEN_PIPE`/`NO_DATA` → `EPIPE`,
+  `DISK_FULL` → `ENOSPC`, `FILENAME_EXCED_RANGE` → `ENAMETOOLONG`, `NOACCESS` → `EFAULT`,
+  everything else → `EIO`. A broken pipe on `read` is end of file (0).
+- `read`/`write` transfer at most `0x7ffff000` bytes per call, like Linux.
+
+### Remaining differences (by design, documented)
+
+- `close(0/1/2)` frees only the fd, not the Windows handle (stdout and stderr are often the
+  **same** console handle on Windows).
+- `write` to a broken pipe returns `-EPIPE`, but there is no `SIGPIPE` that would terminate
+  the process.
+- The console delivers `\r\n` line endings on `read`. Paths are passed to `CreateFileA` as
+  they are: `/` works as a separator, but absolute Linux paths like `/tmp/x` refer to the
+  root of the current drive.
+- The symbol prefix `__l2w_` is reserved. A program must not define the imported Win32 names
+  (`WriteFile`, …) itself.
+
+### Verification
+
+`tests/windows.rs` links the translated programs on Linux against a **Win32 mock**: a C
+implementation (`ms_abi`) of the kernel32 functions above on top of POSIX. Every mock
+function checks the **stack alignment** of the call, clobbers all volatile registers, and
+writes its arguments into the caller's **shadow space** (gcc `-O0`). `examples/hello.s`,
+`loop.s`, `functions.s`, and a file-I/O test program must produce the **same stdout and the
+same exit status** as the original Linux binary. The file-I/O program covers lowest-free fd,
+`O_TRUNC`, `O_APPEND`, `O_EXCL` → `EEXIST`, `ENOENT`, `EBADF` for wrong access mode or a
+closed fd, register and flag preservation across `syscall`, and `exit(318)` → status 62.
+Deliberately broken shims (no `pushfq`/`popfq`, no call frame) are caught by the test.
+The examples also link with MinGW into PE executables that import only `KERNEL32.dll`.
+
 ### Not supported (yet)
 
 - AT&T syntax and `.intel_syntax prefix` (`%rax`)
@@ -422,12 +505,8 @@ cargo test
   semantics (memory vs. immediate, inferred sizes, equate order, numeric labels, `offset`)
   match GAS exactly. The test is skipped if `as`/`objdump` aren't installed.
 
-## Planned translation rules (outline for later phases)
+## Next: phase 6
 
-- **Syscalls:** `read(0)` → `ReadFile`, `write(1)` → `WriteFile`,
-  `open(2)` → `CreateFileA`, `close(3)` → `CloseHandle`,
-  `getpid(39)` → `GetCurrentProcessId`, `exit(60)` → `ExitProcess`. This goes
-  through a small runtime layer that maps Linux file descriptors to Windows
-  `HANDLE`s and converts return values and error codes (`-errno`).
-- If a syscall number isn't statically known, or the semantics can't be preserved,
-  `l2w` reports an error.
+`--compile` runs `x86_64-w64-mingw32-as`/`-gcc` itself: it picks the entry point (`main`
+with the C runtime, or `-nostdlib -e _start -lkernel32`), checks that the tools are
+installed (with installation hints), and passes on diagnostics.

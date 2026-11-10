@@ -31,21 +31,29 @@ fn check_accepts_examples() {
 }
 
 #[test]
-fn check_reports_untranslated_syscalls() {
-    // System calls are translated in phase 5; until then they are reported.
+fn syscalls_are_translated_or_reported() {
     for ex in [
         "examples/hello.s",
         "examples/loop.s",
         "examples/functions.s",
     ] {
         let o = l2w(&[ex, "--check"]);
-        assert_eq!(o.status.code(), Some(1), "{ex}");
-        assert!(
-            stderr(&o).contains("is not translated yet"),
-            "{ex}: {}",
-            stderr(&o)
-        );
+        assert_eq!(o.status.code(), Some(0), "{ex}: {}", stderr(&o));
     }
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let path = dir.join("cli-mmap.s");
+    std::fs::write(
+        &path,
+        ".globl _start\n_start:\n    mov eax, 9\n    syscall\n",
+    )
+    .unwrap();
+    let o = l2w(&[path.to_str().unwrap(), "--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(
+        err.contains(":4:5") && err.contains("`mmap` (9) has no Windows translation"),
+        "{err}"
+    );
 }
 
 #[test]

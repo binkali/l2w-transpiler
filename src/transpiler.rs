@@ -35,11 +35,11 @@
 
 use crate::ast::{Expr, RegKind, Register, Segment, Size, SymbolRef, UnaryOp};
 use crate::compatibility::directives::{map_section, SectionMapping};
-use crate::compatibility::syscalls::linux_syscall_name;
 use crate::diagnostics::{has_errors, Diagnostic, Span};
 use crate::ir::*;
 
 mod bridge;
+mod syscalls;
 
 /// Result of translating a module to Windows.
 #[derive(Debug, Clone)]
@@ -70,7 +70,7 @@ pub fn transpile(module: &Module) -> Translation {
     t.lower_commons();
     t.rewrite_items();
     t.bridge_calling_conventions();
-    t.check_platform();
+    t.translate_syscalls();
     t.diags.sort_by_key(|d| d.span.map(|s| (s.line, s.col)));
     Translation {
         module: t.module,
@@ -469,22 +469,6 @@ impl Transpiler {
     }
 
     // -- platform -------------------------------------------------------------
-
-    fn check_platform(&mut self) {
-        for sc in &self.module.platform.syscalls {
-            let what = match &sc.number {
-                Value::Const(n) => match linux_syscall_name(*n) {
-                    Some(name) => format!("Linux system call `{name}` ({n})"),
-                    None => format!("Linux system call {n}"),
-                },
-                _ => "Linux system call with unknown number".to_string(),
-            };
-            self.diags.push(
-                Diagnostic::error(format!("{what} is not translated yet"), sc.span)
-                    .with_help("system calls are mapped to the Windows API in phase 5"),
-            );
-        }
-    }
 }
 
 /// `call f@PLT` -> `call f`; other modifiers on branch targets are errors.
@@ -668,16 +652,13 @@ mod tests {
 
     #[test]
     fn os_dependent_constructs_are_reported() {
+        // Known system calls and external calls are translated (phases 4, 5).
         let t = translate("_start:\nmov rax, 60\nxor edi, edi\nsyscall\ncall puts\n");
+        assert!(!t.has_errors(), "{:#?}", t.diagnostics);
+        let t = translate("_start:\nmov rax, 57\nsyscall\n");
         let e: Vec<String> = t.diagnostics.iter().map(ToString::to_string).collect();
         assert!(
-            e[0].contains("Linux system call `exit` (60) is not translated yet"),
-            "{e:?}"
-        );
-        // external calls are bridged since phase 4: no error
-        assert_eq!(
-            t.diagnostics.iter().filter(|d| d.is_error()).count(),
-            1,
+            e[0].contains("`fork` (57) has no Windows translation"),
             "{e:?}"
         );
     }
