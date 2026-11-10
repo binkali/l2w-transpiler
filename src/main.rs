@@ -1,0 +1,115 @@
+use l2w::cli::{self, Command, Mode, Options};
+use l2w::diagnostics::{Diagnostic, SourceFile};
+use l2w::{ast::StatementKind, lexer, parser};
+use std::process::ExitCode;
+
+/// Exit codes: 0 = success, 1 = errors in the input, 2 = usage or I/O error.
+const EXIT_INPUT_ERROR: u8 = 1;
+const EXIT_USAGE: u8 = 2;
+
+fn main() -> ExitCode {
+    match cli::parse_args(std::env::args().skip(1)) {
+        Ok(Command::Help) => {
+            print!("{}", cli::USAGE);
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Version) => {
+            println!("l2w {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Run(opts)) => run(&opts),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn run(opts: &Options) -> ExitCode {
+    let name = opts.input.display().to_string();
+    let text = match std::fs::read_to_string(&opts.input) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read `{name}`: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let file = SourceFile::new(name, text);
+    let verbose = |msg: &str| {
+        if opts.verbose {
+            eprintln!("[l2w] {msg}");
+        }
+    };
+    verbose(&format!(
+        "input: {} ({} bytes), target: {}",
+        file.name,
+        file.text.len(),
+        opts.target
+    ));
+
+    if opts.mode == Mode::DumpTokens {
+        let lexed = lexer::tokenize(&file.text);
+        for t in &lexed.tokens {
+            println!("{:>4}:{:<3} {}", t.span.line, t.span.col, t.kind);
+        }
+        return report(&file, &lexed.diagnostics);
+    }
+
+    let parsed = parser::parse(&file.text);
+    verbose(&format!("lexed {} tokens", parsed.token_count));
+    if opts.verbose {
+        let (mut labels, mut instrs, mut dirs) = (0, 0, 0);
+        for s in &parsed.program.statements {
+            match s.kind {
+                StatementKind::Label(_) | StatementKind::NumericLabel(_) => labels += 1,
+                StatementKind::Instruction(_) => instrs += 1,
+                StatementKind::Directive(_) => dirs += 1,
+            }
+        }
+        verbose(&format!(
+            "parsed {} statements: {instrs} instructions, {labels} labels, {dirs} directives",
+            parsed.program.statements.len()
+        ));
+    }
+    let status = report(&file, &parsed.diagnostics);
+    if parsed.has_errors() {
+        return status;
+    }
+
+    match opts.mode {
+        Mode::DumpAst => {
+            println!("{:#?}", parsed.program);
+            ExitCode::SUCCESS
+        }
+        Mode::Check => {
+            eprintln!("{}: ok", file.name);
+            ExitCode::SUCCESS
+        }
+        Mode::Transpile | Mode::Compile => {
+            let d = Diagnostic::global_error(
+                "translation to Windows assembly is not implemented yet (planned for phase 3)",
+            )
+            .with_help("use `--check` or `--dump-ast` to validate the input");
+            eprint!("{}", d.render(&file));
+            ExitCode::from(EXIT_INPUT_ERROR)
+        }
+        Mode::DumpTokens => unreachable!(),
+    }
+}
+
+/// Prints diagnostics to stderr and returns the matching exit code.
+fn report(file: &SourceFile, diags: &[Diagnostic]) -> ExitCode {
+    for d in diags {
+        eprint!("{}", d.render(file));
+    }
+    let errors = diags.iter().filter(|d| d.is_error()).count();
+    if errors > 0 {
+        eprintln!(
+            "error: aborting due to {errors} error{}",
+            if errors == 1 { "" } else { "s" }
+        );
+        ExitCode::from(EXIT_INPUT_ERROR)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
