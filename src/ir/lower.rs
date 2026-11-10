@@ -766,12 +766,14 @@ impl Lowerer {
                 ));
             }
         }
+        let operand_spans = ops.iter().map(|o| o.span).collect();
         Ok(Instr {
             mnemonic,
             lock,
             operands: ops.into_iter().map(|o| o.op).collect(),
             size,
             span,
+            operand_spans,
         })
     }
 
