@@ -1,6 +1,6 @@
 use l2w::cli::{self, Command, Mode, Options};
 use l2w::diagnostics::{Diagnostic, SourceFile};
-use l2w::{ast::StatementKind, ir, lexer, parser};
+use l2w::{ast::StatementKind, codegen, ir, lexer, parser, transpiler};
 use std::process::ExitCode;
 
 /// Exit codes: 0 = success, 1 = errors in the input, 2 = usage or I/O error.
@@ -99,26 +99,50 @@ fn run(opts: &Options) -> ExitCode {
         return status;
     }
 
+    if opts.mode == Mode::DumpIr {
+        println!("{}", lowered.module.summary());
+        println!("# normalized listing");
+        print!("{}", lowered.module);
+        return ExitCode::SUCCESS;
+    }
+
+    let translation = transpiler::transpile(&lowered.module);
+    for note in &translation.notes {
+        verbose(note);
+    }
+    let status = report(&file, &translation.diagnostics);
+    if translation.has_errors() {
+        return status;
+    }
+
     match opts.mode {
-        Mode::DumpIr => {
-            println!("{}", lowered.module.summary());
-            println!("# normalized listing");
-            print!("{}", lowered.module);
-            ExitCode::SUCCESS
-        }
         Mode::Check => {
-            eprintln!("{}: ok", file.name);
+            eprintln!("{}: ok (translatable to {})", file.name, opts.target);
             ExitCode::SUCCESS
         }
-        Mode::Transpile | Mode::Compile => {
+        Mode::Transpile => {
+            let asm = codegen::windows::emit(&translation, &file.name);
+            match &opts.output {
+                Some(path) => {
+                    if let Err(e) = std::fs::write(path, &asm) {
+                        eprintln!("error: cannot write `{}`: {e}", path.display());
+                        return ExitCode::from(EXIT_USAGE);
+                    }
+                    verbose(&format!("wrote {} ({} bytes)", path.display(), asm.len()));
+                }
+                None => print!("{asm}"),
+            }
+            ExitCode::SUCCESS
+        }
+        Mode::Compile => {
             let d = Diagnostic::global_error(
-                "translation to Windows assembly is not implemented yet (planned for phase 3)",
+                "assembling and linking a Windows executable is not implemented yet (planned for phase 6)",
             )
-            .with_help("use `--check` or `--dump-ir` to validate and inspect the input");
+            .with_help("use `-o output.s` to write the Windows assembly");
             eprint!("{}", d.render(&file));
             ExitCode::from(EXIT_INPUT_ERROR)
         }
-        Mode::DumpTokens | Mode::DumpAst => unreachable!(),
+        Mode::DumpTokens | Mode::DumpAst | Mode::DumpIr => unreachable!(),
     }
 }
 

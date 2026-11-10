@@ -333,7 +333,10 @@ pub struct Instr {
     pub operands: Vec<Operand>,
     /// Operation size, where meaningful.
     pub size: Option<Size>,
+    /// Span of the mnemonic.
     pub span: Span,
+    /// Source span of each operand.
+    pub operand_spans: Vec<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

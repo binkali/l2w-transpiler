@@ -20,14 +20,17 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 |---|---|---|
 | 1 | Rust project, CLI, lexer, parser, diagnostics | ✅ done |
 | 2 | AST → intermediate representation, semantic validation, analysis | ✅ done |
-| 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ⏳ planned |
+| 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ✅ done |
 | 4 | Calling-convention compatibility (System V ↔ Windows x64) | ⏳ planned |
 | 5 | Linux system calls → Windows API runtime layer | ⏳ planned |
 | 6 | Windows code generation, cross-compiling with MinGW-w64 | ⏳ planned |
 | 7 | More tests, error handling, documentation | ⏳ planned |
 
-Right now, `--check` (parser **and** IR validation), `--dump-tokens`, `--dump-ast` and
-`--dump-ir` are fully working.
+Right now, translation (`-o`), `--check` (parsing, IR validation and checking that the
+code can be translated to Windows), `--dump-tokens`, `--dump-ast` and `--dump-ir` all work.
+Programs that contain Linux **system calls** (phase 5) or **calls to external functions**
+(phase 4) are still rejected, with an error at each such line. `--compile` follows in
+phase 6.
 Translating (`-o`) and `--compile` stop with a clear "not implemented yet" error
 until phases 3 and 6 are done.
 
@@ -43,7 +46,7 @@ cargo build --release
 ## Usage
 
 ```bash
-l2w input.s -o output.s                    # translate (phase 3+)
+l2w input.s -o output.s                    # translate to Windows assembly (stdout without -o)
 l2w input.s -o output.s --target windows   # same; windows is the default
 l2w input.s --compile -o output.exe        # translate + assemble + link (phase 6+)
 l2w input.s --check                        # parse/analyze only, report diagnostics
@@ -93,17 +96,18 @@ src/
 ├── ir.rs                    IR types + normalized listing printer
 ├── ir/lower.rs              AST → IR: semantics, validation, sizes
 ├── ir/analysis.rs           functions, calls, syscalls, register values
-├── transpiler.rs            Linux → Windows passes                 (phases 3–5)
-├── codegen/{mod,windows}.rs Windows/COFF GAS emitter               (phase 6)
+├── transpiler.rs            Linux → Windows passes (sections, addressing, data)
+├── codegen/{mod,windows}.rs Windows/COFF GAS emitter
 ├── compatibility/
 │   ├── syscalls.rs          Linux syscalls → Win32 API             (phase 5)
 │   ├── calling_convention.rs System V ↔ Windows x64                (phase 4)
-│   └── directives.rs        ELF → COFF sections/directives         (phase 3)
+│   └── directives.rs        ELF → COFF section mapping
 └── linker.rs                MinGW-w64 assembler/linker driver      (phase 6)
 tests/
 ├── cli.rs                   end-to-end tests of the binary
-└── roundtrip.rs             AST/IR → listing → `as` object comparison
-examples/                    sample programs (hello, loop, functions, errors, errors_semantic)
+├── roundtrip.rs             AST/IR → listing → `as` object comparison
+└── windows.rs               MinGW assembly + behavioral equivalence
+examples/                    sample programs (library, hello, loop, functions, errors, errors_semantic)
 ```
 
 ## Supported input (phase 1)
@@ -250,6 +254,73 @@ platform (linux/elf):
   syscall line 19   rax=60 (exit) rdi=0 rsi=&msg rdx=len in _start
 ```
 
+## Windows translation (phase 3)
+
+```bash
+l2w examples/library.s -o library.win.s --verbose
+x86_64-w64-mingw32-as library.win.s -o library.obj
+```
+
+### Sections
+
+| ELF | COFF |
+|---|---|
+| `.text`, `.text.X` | `.text`, `.text$X` (PE grouped section, merged into `.text` by the linker) |
+| `.data`, `.data.X` | `.data`, `.data$X` |
+| `.bss`, `.bss.X` | `.bss`, `.bss$X` |
+| `.rodata`, `.rodata.X`, `.data.rel.ro*` | `.section .rdata,"dr"`, `.rdata$X` |
+| `.note*` (e.g. `.note.GNU-stack`), `.comment`, `.debug*`, non-allocated sections | dropped (an error if a symbol in them is referenced) |
+| `.init_array`, `.fini_array`, `.ctors`, `.dtors`, `.tdata`, `.tbss`, `.eh_frame`, `.got`, `.plt` | **error** |
+
+### Symbols and directives
+
+- `.globl` is kept. Every function gets a COFF symbol record
+  `.def f; .scl 2; .type 32; .endef` (`.scl 3` for local functions).
+- `.type`, `.size`, `.local`, `.file`, `.ident` and `.cfi_*` are ELF-only and are dropped.
+- `.comm`/`.lcomm` become explicit, aligned definitions in `.bss` (global for `.comm`).
+- Windows x64 adds no leading underscore to symbol names, so names stay unchanged.
+
+### Addressing: why rewrites are needed
+
+A Windows x64 image is loaded **above 4 GiB** (MinGW default image base `0x140000000`, plus
+ASLR). Linux non-PIE code, however, often uses 32-bit absolute addresses
+(`R_X86_64_32S`). I checked with MinGW `as`: those relocations would be emitted and would
+then fail at link time. `l2w` therefore rewrites them into equivalent forms:
+
+| Linux | Windows | Why it's equivalent |
+|---|---|---|
+| `mov rax, counter` / `mov rax, [counter]` | `mov rax, qword ptr [rip + counter]` | same address, encoded relative to `rip` |
+| `mov rsi, offset msg` | `lea rsi, [rip + msg]` | same 64-bit value; neither instruction changes flags |
+| `mov rax, [rip + v@GOTPCREL]` | `lea rax, [rip + v]` | the GOT slot holds exactly the address of `v` |
+| `call f@PLT` | `call f` | direct call |
+| `.quad sym`, `.long sym - .` | unchanged | 64-bit absolute / PC-relative relocation |
+
+These are **rejected** because they can't be translated without changing semantics or
+using extra registers:
+
+- `mov eax, offset sym`, `push offset sym`, `add rax, offset sym` (32-bit absolute address);
+- `[rbx + sym]`, `[sym + rcx*8]` (symbol address plus registers); the error message suggests
+  `lea r11, [rip + sym]`;
+- `.long sym`, `.word sym` (absolute address narrower than 64 bits);
+- `fs:`/`gs:` accesses (Linux TLS and stack protector; on Windows `gs:` points to the TEB);
+- accesses below `rsp` (`[rsp - 8]`): Windows has no System V red zone;
+- other ELF relocations (`@GOT`, `@TPOFF`, `@GOTOFF`, …).
+
+Ordinary instructions are copied unchanged, because they mean the same on both systems.
+Constants stay constants (`mov rdx, offset len` for an absolute equate).
+
+### Verification
+
+`tests/windows.rs` checks every translation with real tools:
+
+1. **MinGW-w64 `as`** assembles the output into a `pe-x86-64` object that contains **no**
+   32-bit absolute relocations.
+2. **Behavioral equivalence.** Phase 3 doesn't touch the calling convention yet, so the
+   translated functions are still System V internally. The test reassembles the
+   *translated* code for Linux (mapping back only the COFF section directives), calls it
+   from a C harness, and requires output identical to the original code. This covers
+   lookups, loops, data pointers, `offset`, `@GOTPCREL`, `@PLT`, commons and numeric labels.
+
 ### Not supported (yet)
 
 - AT&T syntax and `.intel_syntax prefix` (`%rax`)
@@ -281,14 +352,13 @@ cargo test
 
 ## Planned translation rules (outline for later phases)
 
-- **Sections:** `.text` → `.text`, `.data` → `.data`, `.bss` → `.bss`,
-  `.rodata` → `.rdata`. `.note.GNU-stack` is dropped. `.type`/`.size` become COFF
-  `.def`/`.scl`/`.type`/`.endef` or are dropped.
 - **Syscalls:** `read(0)` → `ReadFile`, `write(1)` → `WriteFile`,
   `open(2)` → `CreateFileA`, `close(3)` → `CloseHandle`,
   `getpid(39)` → `GetCurrentProcessId`, `exit(60)` → `ExitProcess`. This goes
   through a small runtime layer that maps Linux file descriptors to Windows
   `HANDLE`s and converts return values and error codes (`-errno`).
+- **Red zone via `rbp`:** gcc `-O0` leaf functions store locals at `[rbp - n]` without
+  `sub rsp`. That only works with a red zone; phase 4 will reserve stack space for it.
 - **Calling convention:** argument registers `rdi, rsi, rdx, rcx, r8, r9` →
   `rcx, rdx, r8, r9` + stack, 32 bytes of shadow space, 16-byte stack alignment, and
   saving `rsi`/`rdi`/`xmm6–15` (callee-saved on Windows only).

@@ -25,14 +25,26 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
 
 #[test]
 fn check_accepts_examples() {
+    let o = l2w(&["examples/library.s", "--check"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains(": ok (translatable to windows)"));
+}
+
+#[test]
+fn check_reports_untranslated_syscalls() {
+    // System calls are translated in phase 5; until then they are reported.
     for ex in [
         "examples/hello.s",
         "examples/loop.s",
         "examples/functions.s",
     ] {
         let o = l2w(&[ex, "--check"]);
-        assert!(o.status.success(), "{ex}: {}", stderr(&o));
-        assert!(stderr(&o).contains(": ok"));
+        assert_eq!(o.status.code(), Some(1), "{ex}");
+        assert!(
+            stderr(&o).contains("is not translated yet"),
+            "{ex}: {}",
+            stderr(&o)
+        );
     }
 }
 
@@ -50,7 +62,7 @@ fn check_reports_errors_with_line_and_column() {
 
 #[test]
 fn verbose_prints_statistics() {
-    let o = l2w(&["examples/hello.s", "--check", "--verbose"]);
+    let o = l2w(&["examples/hello.s", "--dump-ir", "--verbose"]);
     assert!(o.status.success());
     let e = stderr(&o);
     assert!(e.contains("[l2w] lexed"), "{e}");
@@ -98,8 +110,45 @@ fn help_and_version() {
 }
 
 #[test]
-fn transpile_is_rejected_until_implemented() {
-    let o = l2w(&["examples/hello.s", "-o", "/dev/null"]);
+fn transpile_writes_windows_assembly() {
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("cli")
+        .join("library.win.s");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let o = l2w(&[
+        "examples/library.s",
+        "-o",
+        out.to_str().unwrap(),
+        "--target",
+        "windows",
+        "--verbose",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let asm = std::fs::read_to_string(&out).unwrap();
+    assert!(asm.contains(".section .rdata,\"dr\""), "{asm}");
+    assert!(asm.contains("mov rax, qword ptr [rip + counter]"), "{asm}");
+    assert!(asm.contains("lea rax, [rip + greeting]"), "{asm}");
+    assert!(
+        asm.contains(".def fib_at; .scl 2; .type 32; .endef"),
+        "{asm}"
+    );
+    assert!(
+        !asm.contains("@function") && !asm.contains(".note"),
+        "{asm}"
+    );
+    let e = stderr(&o);
+    assert!(e.contains("dropped section `.note.GNU-stack`"), "{e}");
+    assert!(e.contains("common symbol `shared` defined in .bss"), "{e}");
+
+    // Without -o the assembly goes to stdout.
+    let o = l2w(&["examples/library.s"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains(".intel_syntax noprefix"));
+}
+
+#[test]
+fn compile_is_rejected_until_implemented() {
+    let o = l2w(&["examples/library.s", "--compile", "-o", "/dev/null"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("not implemented yet"));
 }
