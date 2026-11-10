@@ -1,0 +1,18 @@
+error: invalid scale factor `3`
+ --> examples/errors.s:3:19
+  |
+3 |     mov rax, [rbx*3]
+  |                   ^
+  = help: the index scale must be 1, 2, 4 or 8
+error: unsupported directive `.weak`
+ --> examples/errors.s:5:5
+  |
+5 |     .weak foo
+  |     ^^^^^
+  = help: supported directives: .intel_syntax .text .data .bss .section .global .globl .extern .local .align .balign .p2align .ascii .asciz .string .byte .word .short .2byte .value .long .int .4byte .quad .8byte .zero .skip .space .type .size .set .equ .comm .lcomm .file .ident .loc .cfi_*
+error: `rsp` cannot be used as an index register
+ --> examples/errors.s:6:14
+  |
+6 |     mov rcx, [rsp*2 + rax]
+  |              ^^^^^^^^^^^^^
+error: aborting due to 3 errors

@@ -216,6 +216,7 @@ impl Lowerer {
             flags,
             elf_type: ty,
             items: Vec::new(),
+            span: Some(span),
         });
         let i = self.module.sections.len() - 1;
         self.section_index.insert(name.to_string(), i);
@@ -343,9 +344,10 @@ impl Lowerer {
             .filter(|s| matches!(s.def, SymbolDef::Equate { .. }))
             .map(|s| s.name.clone())
             .collect();
+        let mut memo: HashMap<String, (ValueClass, u32)> = HashMap::new();
         for name in names {
             let mut visiting = Vec::new();
-            let class = self.equate_class(&name, &mut visiting);
+            let class = self.equate_class(&name, &mut visiting, &mut memo);
             if let Some(SymbolDef::Equate { class: c, .. }) =
                 self.module.symbols.get_mut(&name).map(|s| &mut s.def)
             {
@@ -354,7 +356,32 @@ impl Lowerer {
         }
     }
 
-    fn equate_class(&mut self, name: &str, visiting: &mut Vec<String>) -> ValueClass {
+    fn equate_class(
+        &mut self,
+        name: &str,
+        visiting: &mut Vec<String>,
+        memo: &mut HashMap<String, (ValueClass, u32)>,
+    ) -> ValueClass {
+        if let Some((c, _)) = memo.get(name) {
+            return *c;
+        }
+        if visiting.len() > crate::ir::MAX_EQUATE_CHAIN as usize {
+            let span = self
+                .module
+                .symbols
+                .get(name)
+                .and_then(|s| s.def_span)
+                .unwrap_or_default();
+            self.error(
+                format!(
+                    "equate `{name}` ends a chain of more than {} equates defined in terms of each other",
+                    crate::ir::MAX_EQUATE_CHAIN
+                ),
+                span,
+            );
+            memo.insert(name.to_string(), (ValueClass::Unknown, u32::MAX));
+            return ValueClass::Unknown;
+        }
         if visiting.iter().any(|v| v == name) {
             let span = self
                 .module
@@ -374,12 +401,44 @@ impl Lowerer {
             return ValueClass::Unknown;
         };
         visiting.push(name.to_string());
-        let c = self.expr_class(&value, at.section, visiting);
+        let c = self.expr_class(&value, at.section, visiting, memo);
         visiting.pop();
+        // Chain depth: 1 + the deepest equate referenced by the value.
+        let depth = value
+            .symbols()
+            .iter()
+            .filter_map(|r| memo.get(&r.name).map(|(_, d)| *d))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if depth > crate::ir::MAX_EQUATE_CHAIN && depth != u32::MAX {
+            let span = self
+                .module
+                .symbols
+                .get(name)
+                .and_then(|s| s.def_span)
+                .unwrap_or_default();
+            self.error(
+                format!(
+                    "equate `{name}` ends a chain of more than {} equates defined in terms of each other",
+                    crate::ir::MAX_EQUATE_CHAIN
+                ),
+                span,
+            );
+            memo.insert(name.to_string(), (ValueClass::Unknown, u32::MAX));
+            return ValueClass::Unknown;
+        }
+        memo.insert(name.to_string(), (c, depth));
         c
     }
 
-    fn expr_class(&mut self, e: &Expr, here: usize, visiting: &mut Vec<String>) -> ValueClass {
+    fn expr_class(
+        &mut self,
+        e: &Expr,
+        here: usize,
+        visiting: &mut Vec<String>,
+        memo: &mut HashMap<String, (ValueClass, u32)>,
+    ) -> ValueClass {
         use crate::ast::BinaryOp;
         use ValueClass::*;
         match e {
@@ -392,18 +451,18 @@ impl Lowerer {
                 }
                 match self.module.symbols.get(&s.name).map(|s| s.def.clone()) {
                     Some(SymbolDef::Label(loc)) => Relocatable(loc.section),
-                    Some(SymbolDef::Equate { .. }) => self.equate_class(&s.name, visiting),
+                    Some(SymbolDef::Equate { .. }) => self.equate_class(&s.name, visiting, memo),
                     _ => Unknown,
                 }
             }
-            Expr::Unary(_, x) => match self.expr_class(x, here, visiting) {
+            Expr::Unary(_, x) => match self.expr_class(x, here, visiting, memo) {
                 Absolute => Absolute,
                 _ => Unknown,
             },
             Expr::Binary(op, l, r) => {
                 let (l, r) = (
-                    self.expr_class(l, here, visiting),
-                    self.expr_class(r, here, visiting),
+                    self.expr_class(l, here, visiting, memo),
+                    self.expr_class(r, here, visiting, memo),
                 );
                 match (op, l, r) {
                     (_, Absolute, Absolute) => Absolute,

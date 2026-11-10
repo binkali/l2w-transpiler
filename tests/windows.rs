@@ -8,45 +8,12 @@
 //!   COFF section directives are mapped back) and called from a C harness.
 //!   Its output must equal that of the original code.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::*;
 use std::process::Command;
 
 const MINGW_AS: &str = "x86_64-w64-mingw32-as";
 const MINGW_OBJDUMP: &str = "x86_64-w64-mingw32-objdump";
-
-fn available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-fn dir() -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("windows");
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn translate(src: &str, name: &str) -> String {
-    let p = l2w::parser::parse(src);
-    assert!(!p.has_errors(), "{name}: {:#?}", p.diagnostics);
-    let l = l2w::ir::lower(&p.program);
-    assert!(!l.has_errors(), "{name}: {:#?}", l.diagnostics);
-    let t = l2w::transpiler::transpile(&l.module);
-    assert!(!t.has_errors(), "{name}: {:#?}", t.diagnostics);
-    l2w::codegen::windows::emit(&t, name)
-}
-
-fn run(cmd: &mut Command) -> String {
-    let out = cmd.output().unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "{cmd:?} failed:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 const LIBRARY: &str = include_str!("../examples/library.s");
 
@@ -255,30 +222,6 @@ fn mingw_assembles_translations_without_absolute_32bit_relocations() {
             "{name}:\n{relocs}"
         );
     }
-}
-
-/// Maps the COFF section directives of a translation back to ELF ones so the
-/// translated instructions can be executed on the Linux test host.
-fn coff_to_elf_sections(asm: &str) -> String {
-    asm.lines()
-        .filter(|l| !l.starts_with(".def "))
-        .map(|l| {
-            if let Some(rest) = l.strip_prefix(".section ") {
-                let flags = rest.rsplit_once(',').map(|(_, f)| f).unwrap_or("");
-                match flags {
-                    "\"dr\"" => ".section .rodata".to_string(),
-                    "\"dw\"" => ".data".to_string(),
-                    "\"bw\"" => ".bss".to_string(),
-                    "\"xr\"" => ".text".to_string(),
-                    other => panic!("unexpected section flags {other}"),
-                }
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n.section .note.GNU-stack,\"\",@progbits\n"
 }
 
 const HARNESS: &str = r#"
@@ -544,137 +487,6 @@ fail:
     syscall
 .section .note.GNU-stack,"",@progbits
 "#;
-
-const WIN32_MOCK: &str = r#"
-#include <errno.h>
-#include <fcntl.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <unistd.h>
-#define WINAPI __attribute__((ms_abi))
-#define H(fd) ((void *)(intptr_t)((fd) + 0x1000))
-#define FD(h) ((int)((intptr_t)(h) - 0x1000))
-
-static uint32_t last_error;
-
-/* At -O0 rbp = entry rsp - 8, so a correctly aligned call gives rbp % 16 == 0.
-   gcc -O0 spills ms_abi register arguments into the caller's shadow space
-   ([rbp + 16, rbp + 48)), so a missing shadow space corrupts the caller.
-   Volatile registers are clobbered as a real Windows function may do. */
-#define CHECK do { \
-    uint64_t *fp = __builtin_frame_address(0); \
-    if ((uintptr_t)fp & 15) { write(2, "misaligned call\n", 16); _exit(99); } \
-    __asm__ volatile("mov $-1, %%r10\n mov $-1, %%r11\n mov $-1, %%r8\n mov $-1, %%r9\n mov $-1, %%rdx" \
-                     ::: "r8", "r9", "r10", "r11", "rdx"); \
-} while (0)
-
-static uint32_t win_error(int e) {
-    switch (e) {
-    case ENOENT: return 2;      case EMFILE: return 4;   case EACCES: return 5;
-    case EBADF: return 6;       case EEXIST: return 80;  case EINVAL: return 87;
-    case EPIPE: return 109;     case ENOSPC: return 112; case ENAMETOOLONG: return 206;
-    default: return 31;
-    }
-}
-
-WINAPI void *GetStdHandle(uint32_t n) {
-    CHECK;
-    switch ((int32_t)n) { case -10: return H(0); case -11: return H(1); case -12: return H(2); }
-    return (void *)-1;
-}
-WINAPI uint32_t GetLastError(void) { CHECK; return last_error; }
-WINAPI int ReadFile(void *h, void *buf, uint32_t n, uint32_t *got, void *ov) {
-    CHECK;
-    if (ov) abort();
-    ssize_t r = read(FD(h), buf, n);
-    if (r < 0) { last_error = win_error(errno); *got = 0; return 0; }
-    *got = (uint32_t)r; return 1;
-}
-WINAPI int WriteFile(void *h, const void *buf, uint32_t n, uint32_t *put, void *ov) {
-    CHECK;
-    if (ov) abort();
-    ssize_t r = write(FD(h), buf, n);
-    if (r < 0) { last_error = win_error(errno); *put = 0; return 0; }
-    *put = (uint32_t)r; return 1;
-}
-WINAPI void *CreateFileA(const char *path, uint32_t access, uint32_t share, void *sa,
-                         uint32_t disp, uint32_t attrs, void *tmpl) {
-    CHECK;
-    if (share != 7 || sa || tmpl || (attrs != 0x80 && attrs != 1)) abort();
-    int fl;
-    switch (access) {
-    case 0x80000000u: fl = O_RDONLY; break;
-    case 0x40000000u: fl = O_WRONLY; break;
-    case 0xC0000000u: fl = O_RDWR; break;
-    default: abort();
-    }
-    switch (disp) {
-    case 1: fl |= O_CREAT | O_EXCL; break;   /* CREATE_NEW */
-    case 2: fl |= O_CREAT | O_TRUNC; break;  /* CREATE_ALWAYS */
-    case 3: break;                           /* OPEN_EXISTING */
-    case 4: fl |= O_CREAT; break;            /* OPEN_ALWAYS */
-    case 5: fl |= O_TRUNC; break;            /* TRUNCATE_EXISTING */
-    default: abort();
-    }
-    int fd = open(path, fl, attrs == 1 ? 0444 : 0666);
-    if (fd < 0) { last_error = win_error(errno); return (void *)-1; }
-    return H(fd);
-}
-WINAPI int CloseHandle(void *h) {
-    CHECK;
-    if (close(FD(h)) < 0) { last_error = win_error(errno); return 0; }
-    return 1;
-}
-WINAPI int SetFilePointerEx(void *h, int64_t dist, int64_t *pos, uint32_t method) {
-    CHECK;
-    off_t r = lseek(FD(h), dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
-    if (r < 0) { last_error = win_error(errno); return 0; }
-    if (pos) *pos = r;
-    return 1;
-}
-WINAPI uint32_t GetCurrentProcessId(void) { CHECK; return (uint32_t)getpid(); }
-WINAPI void ExitProcess(uint32_t code) { CHECK; _exit((int)code); }
-
-/* The Windows loader calls the entry point like a function. */
-WINAPI void l2w_entry(void);
-int main(void) { l2w_entry(); return 111; }
-"#;
-
-/// Renames the symbol `_start` (not `__l2w_sysv__start`) so the translated
-/// entry point does not clash with the C runtime's `_start`.
-fn rename_entry(asm: &str) -> String {
-    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$';
-    let mut out = String::new();
-    let mut rest = asm;
-    while let Some(i) = rest.find("_start") {
-        let before = rest[..i].chars().last();
-        let after = rest[i + 6..].chars().next();
-        out += &rest[..i];
-        if before.map_or(true, |c| !ident(c)) && after.map_or(true, |c| !ident(c)) {
-            out += "l2w_entry";
-        } else {
-            out += "_start";
-        }
-        rest = &rest[i + 6..];
-    }
-    out + rest
-}
-
-/// Runs `exe` in a fresh directory, returns (stdout, exit code).
-fn run_in(exe: &Path, cwd: &Path) -> (String, i32) {
-    let _ = std::fs::remove_dir_all(cwd);
-    std::fs::create_dir_all(cwd).unwrap();
-    let out = Command::new(exe).current_dir(cwd).output().unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stderr).is_empty(),
-        "{exe:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        out.status.code().expect("exited normally"),
-    )
-}
 
 #[test]
 fn translated_syscalls_behave_like_linux() {

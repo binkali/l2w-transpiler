@@ -7,7 +7,7 @@
 //!
 //! # Translation rules
 //!
-//! **Sections** are mapped by [`compatibility::directives::map_section`]
+//! **Sections** are mapped by [`crate::compatibility::directives::map_section`]
 //! (`.rodata` -> `.rdata`, `.text.X` -> `.text$X`, `.note*` dropped, ...).
 //! Symbols defined in a dropped section must not be referenced.
 //!
@@ -103,7 +103,7 @@ impl Transpiler {
 
     fn map_sections(&mut self) {
         for sec in &self.module.sections {
-            let first_span = sec.items.first().map(item_span);
+            let first_span = sec.span.or_else(|| sec.items.first().map(item_span));
             let mapping = match map_section(&sec.name, sec.kind, sec.flags.as_deref()) {
                 Ok(m) => m,
                 Err(msg) => {
@@ -173,6 +173,7 @@ impl Transpiler {
                     flags: None,
                     elf_type: None,
                     items: Vec::new(),
+                    span: None,
                 });
                 self.sections
                     .push(map_section(".bss", SectionKind::Bss, None).expect(".bss maps"));

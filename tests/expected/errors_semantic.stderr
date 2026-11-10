@@ -1,0 +1,35 @@
+error: operand size mismatch for `mov`: `rax` is 64-bit, but `ebx` is 32-bit
+ --> examples/errors_semantic.s:6:14
+  |
+6 |     mov rax, ebx                # operand size mismatch
+  |              ^^^
+error: ambiguous operand size for `inc`
+ --> examples/errors_semantic.s:7:5
+  |
+7 |     inc [rdi]                   # ambiguous operand size
+  |     ^^^
+  = help: specify the size of the memory operand, e.g. `qword ptr [rax]` or `dword ptr [rax]`
+error: immediate `4294967296` does not fit in a sign-extended 32-bit immediate (64-bit operations only take imm32)
+ --> examples/errors_semantic.s:8:14
+  |
+8 |     add rax, 0x100000000        # immediate does not fit (imm32)
+  |              ^^^^^^^^^^^
+  = help: load the value into a register with `mov` first
+error: unsupported instruction `cpuid`
+ --> examples/errors_semantic.s:9:5
+  |
+9 |     cpuid                       # unsupported instruction
+  |     ^^^^^
+  = help: supported instructions: mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall
+error: no local label `1:` before this reference (`1b`)
+  --> examples/errors_semantic.s:10:5
+   |
+10 |     jmp 1b                      # no numeric label before
+   |     ^^^^^^
+warning: `len` is defined after this use, so GNU as treats this operand as a memory access to address `len`, not as the value
+  --> examples/errors_semantic.s:11:14
+   |
+11 |     mov rdx, len                # warning: len defined later -> memory access
+   |              ^^^
+   = help: move the definition of `len` before its first use, or write `offset len` to use the value
+error: aborting due to 5 errors

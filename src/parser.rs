@@ -1,4 +1,4 @@
-//! Recursive-descent parser: token stream -> [`ast::Program`].
+//! Recursive-descent parser: token stream -> [`crate::ast::Program`].
 //!
 //! Grammar (informal):
 //!
@@ -101,6 +101,8 @@ pub fn parse(src: &str) -> ParseOutput {
         tokens: lexed.tokens,
         pos: 0,
         diagnostics: lexed.diagnostics,
+        depth: 0,
+        operators: 0,
     };
     let program = p.program();
     let mut diagnostics = p.diagnostics;
@@ -119,7 +121,17 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// Current nesting depth of unary operators and parentheses.
+    depth: u32,
+    /// Binary operators in the current top-level expression.
+    operators: u32,
 }
+
+/// Limits that keep recursive processing of expressions (parsing,
+/// evaluation, printing) far away from stack exhaustion. GAS input never
+/// comes close to them.
+const MAX_EXPR_DEPTH: u32 = 64;
+const MAX_EXPR_OPERATORS: u32 = 1000;
 
 impl<'a> Parser<'a> {
     // -- token helpers ------------------------------------------------------
@@ -564,6 +576,9 @@ impl<'a> Parser<'a> {
     // -- expressions --------------------------------------------------------
 
     fn expr(&mut self) -> PResult<Expr> {
+        if self.depth == 0 {
+            self.operators = 0;
+        }
         self.binary_level(0)
     }
 
@@ -598,6 +613,13 @@ impl<'a> Parser<'a> {
         'outer: loop {
             for (tok, op) in LEVELS[level] {
                 if self.peek() == tok {
+                    self.operators += 1;
+                    if self.operators > MAX_EXPR_OPERATORS {
+                        return Err(Diagnostic::error(
+                            format!("expression has more than {MAX_EXPR_OPERATORS} operators"),
+                            self.span(),
+                        ));
+                    }
                     self.bump();
                     let rhs = self.binary_level(level + 1)?;
                     lhs = Expr::binary(*op, lhs, rhs);
@@ -609,6 +631,19 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(Diagnostic::error(
+                format!("expression is nested more than {MAX_EXPR_DEPTH} levels deep"),
+                self.span(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn unary_inner(&mut self) -> PResult<Expr> {
         match self.peek() {
             TokenKind::Minus => {
                 self.bump();

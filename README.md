@@ -24,13 +24,37 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 | 4 | Calling-convention compatibility (System V ↔ Windows x64) | ✅ done |
 | 5 | Linux system calls → Windows API runtime layer | ✅ done |
 | 6 | Windows code generation, cross-compiling with MinGW-w64 | ✅ done |
-| 7 | More tests, error handling, documentation | ⏳ planned |
+| 7 | More tests, error handling, documentation | ✅ done |
 
 Everything up to a Windows executable works: translation (`-o`), `--compile`, `--check` (parsing, IR validation and checking that the
 code can be translated to Windows), `--dump-tokens`, `--dump-ast` and `--dump-ir` all work.
 Calls to external (Windows/CRT) functions and Windows calls into the program (`main`,
 exported functions) are bridged, and Linux **system calls** are implemented on top of the
 Win32 API. `--compile` assembles and links with MinGW-w64 into a `.exe`.
+
+## Quick start
+
+```bash
+cargo build --release
+./target/release/l2w examples/hello.s --check            # can it be translated?
+./target/release/l2w examples/hello.s -o hello.win.s     # Windows assembly
+./target/release/l2w examples/hello.s --compile -v       # hello.exe (needs MinGW-w64)
+wine hello.exe                                           # or run it on Windows
+```
+
+## Feature matrix
+
+| Area | Supported (translated, semantics preserved) | Rejected with a diagnostic | Documented differences |
+|---|---|---|---|
+| Syntax | GAS Intel syntax (`noprefix`), labels, numeric labels `1:`/`1b`/`1f`, equates, expressions, comments | AT&T syntax, `.intel_syntax prefix`, macros, `.if`, `.include`, floating-point literals | – |
+| Instructions | `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall`, `lock` prefix | everything else (SSE/AVX, `setcc`, `cmovcc`, string instructions, `movabs`, …) with the list of supported ones | – |
+| Operands | registers (8–64 bit, `ah`–`dh`), immediates (range-checked), all memory forms, `offset`, `rip`-relative | invalid scale/index, size mismatches, ambiguous sizes, `ah` with REX, `fs:`/`gs:` (TLS) | – |
+| Addressing | `[sym]` → `[rip + sym]`, `mov r64, offset sym` → `lea`, `@GOTPCREL`/`@PLT` resolved | `[reg + sym]`, `.long sym`, `push offset sym` (32-bit absolute addresses), red zone below `rsp` | – |
+| Sections | `.text .data .bss .rodata(.X) .data.rel.ro` → `.text .data .bss .rdata`, `.comm`/`.lcomm` → `.bss`, notes/debug dropped | `.init_array`, `.fini_array`, `.ctors`, TLS (`.tdata`/`.tbss`), `.eh_frame`, hand-written `.got`/`.plt` | – |
+| Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args |
+| System calls | `read write open close getpid exit exit_group` via Win32 shims (registers + RFLAGS preserved, `-errno`) | unknown syscall numbers, unsupported calls (`mmap`, `fork`, …), untranslatable static `open` flags | `close(0/1/2)` keeps the handle; no `SIGPIPE`; console `\r\n`; absolute paths are relative to the current drive |
+| Build | `--compile` with MinGW-w64 (`main` → C runtime, `_start` → `-nostdlib -lkernel32`) | missing/non-Windows compiler (exit 2, install hints), linker errors (exit 1, hints) | – |
+| Robustness | – | input that would exhaust resources: expressions nested > 64 levels or with > 1000 operators, equate chains > 100 | – |
 
 ## Building
 
@@ -64,19 +88,18 @@ undefined references), `2` usage, I/O or toolchain error (MinGW-w64 missing).
 ```text
 $ l2w examples/errors.s --check
 error: invalid scale factor `3`
-  --> examples/errors.s:3:19
-   |
- 3 |     mov rax, [rbx*3]
-   |                   ^
+ --> examples/errors.s:3:19
+  |
+3 |     mov rax, [rbx*3]
+  |                   ^
   = help: the index scale must be 1, 2, 4 or 8
 error: unsupported directive `.weak`
-  --> examples/errors.s:5:5
-   |
- 5 |     .weak foo
-   |     ^^^^^
-error: `rsp` cannot be used as an index register
-  --> examples/errors.s:6:14
-   ...
+ --> examples/errors.s:5:5
+  |
+5 |     .weak foo
+  |     ^^^^^
+  = help: supported directives: .intel_syntax .text .data .bss .section ...
+...
 error: aborting due to 3 errors
 ```
 
@@ -475,7 +498,9 @@ closed fd, register and flag preservation across `syscall`, and `exit(318)` → 
 Deliberately broken shims (no `pushfq`/`popfq`, no call frame) are caught by the test.
 The examples also link with MinGW into PE executables that import only `KERNEL32.dll`.
 
-### Not supported (yet)
+### Not supported
+
+See also the [feature matrix](#feature-matrix).
 
 - AT&T syntax and `.intel_syntax prefix` (`%rax`)
 - Macros (`.macro`, `.rept`, `.irp`), conditional assembly (`.if`), `.include`
@@ -488,21 +513,55 @@ The examples also link with MinGW into PE executables that import only `KERNEL32
 ## Tests
 
 ```bash
-cargo test
+cargo test                          # everything (~100 tests, a few seconds)
+cargo test --test spec              # the specification test matrix
+L2W_FUZZ_ITERATIONS=60000 cargo test --release --test robustness   # longer fuzzing
+L2W_BLESS=1 cargo test --test spec golden   # regenerate the expected diagnostics
 ```
 
-- **Unit tests** cover the lexer, parser, AST printer, CLI parsing and diagnostic
-  rendering.
-- **`tests/cli.rs`** runs the binary end to end: `--check`, `--verbose`, dumps,
-  exit codes, and error positions.
-- **`tests/roundtrip.rs`** is a semantic check in two stages:
-  1. AST → printed source;
-  2. AST → **IR** → normalized listing.
+Tests that need external tools (GNU `as`, `gcc`, MinGW-w64, Wine) skip themselves
+with a message if the tool is missing.
 
-  For each stage, GNU `as` assembles **both** the original and the generated text, and the
-  object contents and relocations must be identical. This shows that the IR's operand
-  semantics (memory vs. immediate, inferred sizes, equate order, numeric labels, `offset`)
-  match GAS exactly. The test is skipped if `as`/`objdump` aren't installed.
+| Suite | What it shows |
+|---|---|
+| unit tests (`src/**`) | lexer, parser, IR lowering and validation, analysis, every transpiler pass, shim generation, link plans, CLI parsing, diagnostic rendering |
+| `tests/roundtrip.rs` | AST and IR listings assemble **byte-identically** to the original with GNU `as`: the front end understands the source exactly like GAS |
+| `tests/windows.rs` | MinGW assembles every translation without 32-bit absolute relocations; the translated code **behaves like the original** (C harness calls the exports with `ms_abi`; 10-argument calls both ways; rsi/rdi preservation; syscall shims against the Win32 mock) |
+| `tests/spec.rs` | the test matrix of the specification (below) |
+| `tests/cli.rs` | the binary end to end: all modes, exit codes, error positions, `--compile` (PE header, machine, imports; Wine run when available), toolchain errors |
+| `tests/robustness.rs` | mutation fuzzing of the examples (3,000 mutants by default) and pathological inputs: no stage panics, every diagnostic position is valid |
+
+### Specification test matrix (`tests/spec.rs`)
+
+Each behavioral test builds its program twice: the **original** as a static Linux
+executable, and the **translation** linked against the Win32 mock, with external C functions
+compiled with `ms_abi`, i.e. with real Windows calling-convention semantics. Both must
+produce **the same stdout and exit status**.
+
+| # | Requirement | Test | Covers |
+|---|---|---|---|
+| 1 | arithmetic with `mov`, `add`, `sub` | `spec_01_arithmetic` | also `imul idiv div and or xor not neg inc dec sar shr shl lea xchg`, 32-bit zero extension, 8-bit writes, overflow |
+| 2 | conditions with `cmp` and `je` | `spec_02_conditions` | 20 `jcc` aliases (`je/jz … ja/jnbe, jb, js`) against a reference model, signed and unsigned edge values, `test` |
+| 3 | loops with labels and `jmp` | `spec_03_loops` | top-tested, nested, `dec/jnz`, numeric labels `1b`/`1f` |
+| 4 | string output with `write` | `spec_04_write` | return values, partial and zero-length writes, invalid fd → `-EBADF` |
+| 5 | program exit with `exit` | `spec_05_exit` | `exit`/`exit_group`, status 0…300 and −1 (truncated to 8 bits) |
+| 6 | function calls, different argument counts | `spec_06_function_calls` | external calls with 0–10 arguments (weighted sums detect swapped arguments), `int` arguments, internal calls with stack arguments, recursion, tail call into an external function, callee-saved registers |
+| 7 | `.data` and `.bss` | `spec_07_data_and_bss` | arrays, 8/16/32/64-bit data, read-modify-write, zeroed `.bss`, `.comm`, pointers in data, `.balign 64`, equates |
+| 8 | faulty or unsupported instructions | `spec_08_diagnostics`, `spec_08_golden_diagnostics` | 17 cases with **exact line and column**; complete `--check` output of `examples/errors*.s` against `tests/expected/*.stderr` |
+| 9 | stack alignment, shadow space | `spec_09_alignment_and_shadow_space`, `spec_09_red_zone_is_rejected` | external calls and syscalls from **every** stack alignment (the callee checks 16-byte alignment); callee overwrites its shadow space while caller data stays intact; red-zone use is rejected |
+| 10 | Windows codegen, cross-compiling | `spec_10_cross_compilation` | `--compile` produces PE executables (run under Wine when available) |
+
+### Error handling
+
+- Every error has the **line and column** of the construct that caused it, rustc-style
+  rendering with carets, and usually a `help:` line. Global errors (no source position) are
+  used only when there is no single position, e.g. a missing entry point.
+- Errors don't stop the analysis: all errors in a file are reported together. Translation
+  and code generation only run if there were no errors.
+- `l2w` never panics on input. Recursion is bounded (expression depth and size, equate
+  chains), and fuzzing checks that every diagnostic position lies inside the file.
+- Exit codes: `0` ok, `1` errors in the input (including assembler/linker errors),
+  `2` usage, I/O, or toolchain errors.
 
 ## Building executables (phase 6)
 
@@ -533,7 +592,9 @@ cargo test
 `.exe` files and compares their output. It also tests a missing compiler, a host `gcc`
 given via `L2W_CC`, an undefined symbol, and a missing entry point.
 
-## Next: phase 7
+## Possible extensions
 
-More tests on real Windows/Wine, more instructions (`setcc`, `cmovcc`, string
-instructions), and more system calls (`lseek`, `fstat`, `mmap` → `VirtualAlloc`).
+More instructions (`setcc`, `cmovcc`, string instructions, SSE with `xmm6–15` saving in
+the wrappers), more system calls (`lseek` → `SetFilePointerEx`, `fstat`, `mmap` →
+`VirtualAlloc`, `brk`), callbacks (Windows → System V thunks for function pointers that
+are passed to Windows code), and `.weak`/macros in the front end.

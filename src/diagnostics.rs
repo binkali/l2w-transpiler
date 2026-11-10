@@ -101,23 +101,37 @@ impl Diagnostic {
     }
 
     /// Renders the diagnostic against its source file.
+    /// Renders the diagnostic in rustc style; the gutter width follows the
+    /// line number:
+    ///
+    /// ```text
+    /// error: message
+    ///   --> file.s:12:5
+    ///    |
+    /// 12 |     cpuid
+    ///    |     ^^^^^
+    ///    = help: ...
+    /// ```
     pub fn render(&self, file: &SourceFile) -> String {
         let mut out = format!("{}: {}\n", self.severity, self.message);
+        let mut pad = " ".to_string();
         if let Some(span) = self.span {
-            out.push_str(&format!("  --> {}:{}:{}\n", file.name, span.line, span.col));
+            pad = " ".repeat(span.line.to_string().len());
+            out.push_str(&format!(
+                "{pad}--> {}:{}:{}\n",
+                file.name, span.line, span.col
+            ));
             if let Some(text) = file.line(span.line) {
-                let gutter = span.line.to_string().len();
-                let pad = " ".repeat(gutter);
                 let text = text.replace('\t', " ");
-                out.push_str(&format!(" {pad} |\n"));
-                out.push_str(&format!(" {} | {}\n", span.line, text));
+                out.push_str(&format!("{pad} |\n"));
+                out.push_str(&format!("{} | {}\n", span.line, text));
                 let caret_pad = " ".repeat(span.col.saturating_sub(1) as usize);
                 let carets = "^".repeat(span.len.max(1) as usize);
-                out.push_str(&format!(" {pad} | {caret_pad}{carets}\n"));
+                out.push_str(&format!("{pad} | {caret_pad}{carets}\n"));
             }
         }
         for help in &self.help {
-            out.push_str(&format!("  = help: {help}\n"));
+            out.push_str(&format!("{pad} = help: {help}\n"));
         }
         out
     }
@@ -174,10 +188,19 @@ mod tests {
         let file = SourceFile::new("t.s", "mov rax, 1\n  foo rbx\n");
         let d = Diagnostic::error("unknown thing", Span::new(2, 3, 3)).with_help("try bar");
         let r = d.render(&file);
-        assert!(r.contains("--> t.s:2:3"), "{r}");
-        assert!(r.contains(" 2 |   foo rbx"), "{r}");
-        assert!(r.contains("   |   ^^^"), "{r}");
-        assert!(r.contains("= help: try bar"), "{r}");
+        assert_eq!(
+            r,
+            "error: unknown thing\n --> t.s:2:3\n  |\n2 |   foo rbx\n  |   ^^^\n  = help: try bar\n"
+        );
+        // The gutter grows with the line number.
+        let file = SourceFile::new("t.s", "\n".repeat(11) + "cpuid\n");
+        let r = Diagnostic::error("x", Span::new(12, 1, 5))
+            .with_help("h")
+            .render(&file);
+        assert_eq!(
+            r,
+            "error: x\n  --> t.s:12:1\n   |\n12 | cpuid\n   | ^^^^^\n   = help: h\n"
+        );
     }
 
     #[test]

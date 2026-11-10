@@ -18,7 +18,16 @@ fn main() -> ExitCode {
             println!("l2w {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Command::Run(opts)) => run(&opts),
+        // The pipeline bounds all recursion (expression depth, equate
+        // chains); the large stack is an extra safety margin.
+        Ok(Command::Run(opts)) => std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || run(&opts))
+            .and_then(|h| h.join().map_err(|_| std::io::Error::other("l2w crashed")))
+            .unwrap_or_else(|e| {
+                eprintln!("error: internal error: {e}");
+                ExitCode::from(EXIT_USAGE)
+            }),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(EXIT_USAGE)
