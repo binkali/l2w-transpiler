@@ -1,6 +1,6 @@
 //! Intermediate representation.
 //!
-//! The IR is produced from the AST by [`lower`] and is the single source of
+//! The IR is produced from the AST by [`lower()`] and is the single source of
 //! truth for all translation passes. It separates two layers:
 //!
 //! * **Architecture layer** — [`Section`]s containing [`Item`]s: labels,
@@ -186,6 +186,10 @@ pub enum Mnemonic {
     Nop,
     Syscall,
 }
+
+/// Maximum length of a chain of equates defined in terms of each other
+/// (`.set a1, a0 + 1`, `.set a2, a1 + 1`, ...).
+pub const MAX_EQUATE_CHAIN: u32 = 100;
 
 /// Mnemonics accepted by [`Mnemonic::parse`] (for help messages).
 pub const SUPPORTED_MNEMONICS: &str = "mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall";
@@ -446,6 +450,8 @@ pub struct Section {
     pub flags: Option<String>,
     pub elf_type: Option<String>,
     pub items: Vec<Item>,
+    /// Where the section was first entered (`None` for generated sections).
+    pub span: Option<Span>,
 }
 
 /// A contiguous run of items of one section, in source order. Sections
@@ -587,9 +593,12 @@ impl SymbolTable {
         self.eval_depth(e, 0)
     }
 
+    /// `depth` counts equate hops; the expression nesting itself is bounded
+    /// by the parser. Chains longer than [`MAX_EQUATE_CHAIN`] are rejected
+    /// during lowering, so this limit is never reached for valid modules.
     fn eval_depth(&self, e: &Expr, depth: u32) -> Option<i64> {
         use crate::ast::{BinaryOp::*, UnaryOp};
-        if depth > 64 {
+        if depth > MAX_EQUATE_CHAIN {
             return None;
         }
         Some(match e {
@@ -600,13 +609,10 @@ impl SymbolTable {
                 }
                 _ => return None,
             },
-            Expr::Unary(UnaryOp::Neg, x) => self.eval_depth(x, depth + 1)?.wrapping_neg(),
-            Expr::Unary(UnaryOp::Not, x) => !self.eval_depth(x, depth + 1)?,
+            Expr::Unary(UnaryOp::Neg, x) => self.eval_depth(x, depth)?.wrapping_neg(),
+            Expr::Unary(UnaryOp::Not, x) => !self.eval_depth(x, depth)?,
             Expr::Binary(op, l, r) => {
-                let (l, r) = (
-                    self.eval_depth(l, depth + 1)?,
-                    self.eval_depth(r, depth + 1)?,
-                );
+                let (l, r) = (self.eval_depth(l, depth)?, self.eval_depth(r, depth)?);
                 match op {
                     Add => l.wrapping_add(r),
                     Sub => l.wrapping_sub(r),

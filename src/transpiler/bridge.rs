@@ -276,8 +276,14 @@ impl Transpiler {
         };
         for item in &self.module.sections[f.section].items[f.start..f.end] {
             let Some(ins) = instr(item) else { continue };
+            // `[rsp + k]` with k >= 0 is argc/argv/envp; negative offsets are
+            // red-zone accesses, reported by the addressing pass.
+            let symbols = &self.module.symbols;
             let reads_stack = ins.mnemonic == Mnemonic::Pop
-                || ins.operands.iter().any(|o| matches!(o, Operand::Mem(m) if m.base.is_some_and(|b| b.kind == RegKind::Gpr(4))));
+                || ins.operands.iter().any(|o| {
+                    matches!(o, Operand::Mem(m) if m.base.is_some_and(|b| b.kind == RegKind::Gpr(4))
+                        && m.disp.as_ref().map_or(Some(0), |d| symbols.eval(d)).map_or(true, |d| d >= 0))
+                });
             if reads_stack {
                 self.diags.push(
                     Diagnostic::error(
@@ -468,6 +474,7 @@ impl Transpiler {
             flags: None,
             elf_type: None,
             items: Vec::new(),
+            span: None,
         });
         self.sections
             .push(map_section(name, kind, None).expect("standard section maps"));
