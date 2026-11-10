@@ -1,0 +1,299 @@
+# Project: Linux-to-Windows x86-64 Assembly Transpiler
+
+Du bist ein erfahrener Compiler- und Systems-Programming-Entwickler. Entwickle einen funktionierenden Assembly-to-Assembly-Transpiler in Rust, der Linux x86-64 Assembly im GNU Assembler (GAS) Intel-Syntax-Format in Windows x86-64 Assembly übersetzt.
+
+## 1. Projektziel
+
+Entwickle ein CLI-Programm, das Linux-Assembly-Quellcode einliest, analysiert und möglichst automatisch in Windows-kompatiblen Assembly-Code übersetzt.
+
+**Input:**
+- GNU Assembler (GAS)
+- Intel-Syntax (`.intel_syntax noprefix`)
+- x86-64
+- Linux ABI / System V ABI
+- ELF-spezifische Direktiven und Linux-Systemcalls
+
+**Output:**
+- GNU Assembler (GAS)
+- Intel-Syntax
+- x86-64
+- Windows x64 ABI
+- Windows-kompatible API-Aufrufe
+- COFF-kompatible Assembly-Ausgabe
+
+Das finale Ziel ist, aus Linux-Assembly eine unter Windows ausführbare `.exe` erzeugen zu können.
+
+## 2. Technische Anforderungen
+
+- Programmiersprache: Rust
+- CLI-Anwendung
+- Modulare Architektur
+- Saubere Fehlerbehandlung
+- Aussagekräftige Fehlermeldungen
+- Keine einfache Regex-basierte Textumwandlung
+- Verwende einen Lexer und Parser.
+- Verwende eine Intermediate Representation (IR), um den Code unabhängig vom Quell- und Zielformat zu analysieren.
+
+## 3. Architektur
+
+Strukturiere das Projekt in folgende Module:
+
+src/
+- main.rs
+- cli.rs
+- lexer.rs
+- parser.rs
+- ast.rs
+- ir.rs
+- transpiler.rs
+- codegen/
+  - mod.rs
+  - windows.rs
+- compatibility/
+  - mod.rs
+  - syscalls.rs
+  - calling_convention.rs
+  - directives.rs
+- diagnostics.rs
+- linker.rs
+
+Die Module sollen klar voneinander getrennt sein.
+
+### Lexer
+Erkennt:
+- Assembly-Instruktionen
+- Register
+- Zahlen und Konstanten
+- Labels
+- Kommentare
+- Strings
+- Direktiven
+- Speicheroperanden
+- Symbolreferenzen
+
+### Parser
+Erzeugt einen strukturierten AST aus dem GAS-Intel-Syntax-Code.
+
+Unterstütze insbesondere:
+- `.intel_syntax noprefix`
+- `.text`
+- `.data`
+- `.bss`
+- `.global`
+- `.globl`
+- `.section`
+- `.align`
+- `.asciz`
+- `.ascii`
+- `.string`
+- `.byte`
+- `.word`
+- `.long`
+- `.quad`
+- `.zero`
+- `.skip`
+- `.type`
+- `.size`
+
+### Intermediate Representation
+Die IR soll Betriebssystem-spezifische und architekturspezifische Informationen getrennt darstellen.
+
+Sie soll unter anderem enthalten:
+- Instruktionen
+- Register
+- Operanden
+- Labels
+- Funktionen
+- Datenbereiche
+- Externe Symbole
+- Funktionsaufrufe
+- Systemcalls
+- Section-Informationen
+
+## 4. Instruction Handling
+
+Normale x86-64-Instruktionen sollen unverändert übernommen werden, sofern sie unter beiden Zielumgebungen dieselbe Semantik besitzen.
+
+Unterstütze zunächst:
+- mov
+- lea
+- add
+- sub
+- imul
+- idiv
+- xor
+- and
+- or
+- not
+- neg
+- inc
+- dec
+- cmp
+- test
+- jmp
+- je / jz
+- jne / jnz
+- jg / jnle
+- jl / jnge
+- jge / jnl
+- jle / jng
+- ja / jnbe
+- jb / jnae
+- jae / jnb
+- jbe / jna
+- push
+- pop
+- call
+- ret
+- nop
+- syscall
+
+Achte auf korrekte Operandengrößen, Speicherzugriffe und Register.
+
+Nicht unterstützte Instruktionen müssen einen verständlichen Fehler erzeugen.
+
+## 5. Linux Systemcalls zu Windows API
+
+Das ist eine der wichtigsten Funktionen des Projekts.
+
+Implementiere zunächst die Übersetzung folgender Linux-Systemcalls:
+
+| Linux | Nummer | Windows-Entsprechung |
+|---|---:|---|
+| read | 0 | ReadFile |
+| write | 1 | WriteFile |
+| open | 2 | CreateFileA |
+| close | 3 | CloseHandle |
+| exit | 60 | ExitProcess |
+| getpid | 39 | GetCurrentProcessId |
+
+Wichtig:
+- Die Linux-Systemcall-Nummer steht in RAX.
+- Linux-Systemcall-Argumente werden über RDI, RSI, RDX, R10, R8 und R9 übergeben.
+- Windows API-Funktionen verwenden die Windows x64 Calling Convention.
+- Die ersten vier Integer-Argumente werden über RCX, RDX, R8 und R9 übergeben.
+- Weitere Argumente werden über den Stack übergeben.
+- Beachte die 32 Byte Shadow Space.
+- Beachte Stack-Alignment.
+- Beachte die unterschiedlichen Rückgabewerte und Fehlerkonventionen.
+
+**Wichtig:** Die oben genannten Zuordnungen sind nicht alle direkte Ersetzungen. Beispielsweise unterscheiden sich Linux-Dateideskriptoren und Windows-Handles. Implementiere deshalb einen kleinen Runtime-Compatibility-Layer, der diese Unterschiede behandelt.
+
+Verwende die Windows API über externe Symbole, beispielsweise `WriteFile` aus `kernel32.dll`.
+
+Erzeuge korrekte externe Deklarationen für die benötigten Windows-Funktionen.
+
+Wenn ein Systemcall nicht zuverlässig übersetzt werden kann, brich mit einer aussagekräftigen Fehlermeldung ab, anstatt falschen Code zu generieren.
+
+## 6. Calling Convention
+
+Implementiere einen eigenen Compatibility-Layer für die Linux System V ABI und die Windows x64 ABI.
+
+Berücksichtige:
+- Unterschiedliche Argumentregister
+- Caller-saved und callee-saved Register
+- Stack-Alignment
+- Shadow Space
+- Rückgaberegister
+- Stack-Argumente
+- Register-Erhaltung
+
+Wichtig: Unterscheide zwischen normalen Funktionsaufrufen und Linux-Systemcalls. Die Systemcall-Konvention ist nicht identisch mit der System-V-Funktionskonvention.
+
+## 7. Sections und Executable-Format
+
+Linux ELF-spezifische Sections müssen auf geeignete Windows-COFF-Sections abgebildet werden.
+
+Beispiele:
+- `.text` → `.text`
+- `.data` → `.data`
+- `.bss` → `.bss`
+- `.rodata` → `.rdata`
+
+Berücksichtige auch:
+- Symbolnamen
+- Globale Symbole
+- Externe Symbole
+- Relocations
+- RIP-relative Adressierung
+
+## 8. CLI
+
+Implementiere folgende Befehle:
+
+```bash
+l2w input.s -o output.s
+l2w input.s -o output.s --target windows
+l2w input.s --compile -o output.exe
+l2w input.s --check
+l2w input.s --verbose
+```
+
+`--compile` soll:
+1. Den Quellcode übersetzen.
+2. Die Windows-Assembly-Datei generieren.
+3. GNU Assembler mit einem Windows-Target oder einen geeigneten Cross-Assembler aufrufen.
+4. Den Windows-Linker aufrufen.
+5. Eine `.exe` erzeugen.
+
+Verwende unter Linux beispielsweise MinGW-w64, sofern installiert.
+
+Prüfe die Verfügbarkeit externer Tools und gib hilfreiche Installationshinweise aus.
+
+## 9. Tests
+
+Erstelle Unit- und Integrationstests.
+
+Teste mindestens:
+
+1. Einfaches Rechnen mit `mov`, `add` und `sub`.
+2. Bedingungen mit `cmp` und `je`.
+3. Schleifen mit Labels und `jmp`.
+4. String-Ausgabe mit Linux `write`.
+5. Programmende mit Linux `exit`.
+6. Funktionsaufrufe mit unterschiedlichen Argumentzahlen.
+7. Datenbereiche mit `.data` und `.bss`.
+8. Fehlerhafte oder nicht unterstützte Instruktionen.
+9. Stack-Alignment und Windows Shadow Space.
+10. Windows-Codegenerierung und Cross-Kompilierung.
+
+## 10. Entwicklungsstrategie
+
+Arbeite inkrementell.
+
+**Phase 1:** Rust-Projekt, CLI, Lexer und Parser.
+
+**Phase 2:** AST und Intermediate Representation.
+
+**Phase 3:** Übersetzung normaler x86-64-Instruktionen und GAS-Direktiven.
+
+**Phase 4:** Calling-Convention-Kompatibilität.
+
+**Phase 5:** Linux-Systemcalls und Windows-API-Compatibility-Layer.
+
+**Phase 6:** Windows-Codegenerierung und Cross-Kompilierung.
+
+**Phase 7:** Tests, Fehlerbehandlung und Dokumentation.
+
+Implementiere nicht alle Funktionen gleichzeitig. Jede Phase muss kompilierbar und testbar sein, bevor du mit der nächsten beginnst.
+
+## 11. Qualität und Dokumentation
+
+- Schreibe idiomatischen, modernen Rust-Code.
+- Verwende sinnvolle Structs und Enums.
+- Vermeide unnötige Abhängigkeiten.
+- Dokumentiere komplexe Übersetzungsregeln.
+- Schreibe eine ausführliche README.md.
+- Dokumentiere unterstützte und nicht unterstützte Funktionen.
+- Verhindere stillschweigend fehlerhafte Übersetzungen.
+- Erzeuge bei nicht unterstützten Features präzise Diagnostics mit Zeilen- und Spaltenangaben.
+
+## 12. Wichtige Grundregel
+
+Das Ziel ist kein einfacher Syntax-Konverter.
+
+Das Ziel ist ein echter, modularer Transpiler, der die semantischen Unterschiede zwischen Linux und Windows berücksichtigt.
+
+Erzeuge nur dann Windows-Code, wenn die Semantik der übersetzten Operation erhalten bleibt. Wenn das nicht möglich ist, gib eine klare Fehlermeldung aus.
+
+Beginne jetzt mit Phase 1. Analysiere zunächst die Anforderungen, erstelle die Projektstruktur und implementiere anschließend Lexer, Parser und CLI. Arbeite direkt im aktuellen Repository und erkläre nach jeder Phase kurz, was implementiert wurde und wie ich es testen kann.
