@@ -83,23 +83,15 @@ mod tests {
         let t = crate::transpiler::transpile(&l.module);
         assert!(!t.has_errors(), "{:#?}", t.diagnostics);
         let out = emit(&t, "t.s");
-        let expected = "\
-.intel_syntax noprefix
-
-.globl f
-
-.def f; .scl 2; .type 32; .endef
-
-.section .rdata,\"dr\"
-msg:
-    .ascii \"hi\\000\"
-
-.text
-f:
-    lea rax, [rip + msg]
-    ret
-";
-        assert!(out.ends_with(expected), "{out}");
+        for expected in [
+            ".intel_syntax noprefix\n",
+            "\n.globl f\n",
+            ".def __l2w_sysv_f; .scl 3; .type 32; .endef\n.def f; .scl 2; .type 32; .endef\n",
+            "\n.section .rdata,\"dr\"\nmsg:\n    .ascii \"hi\\000\"\n",
+            "\n.text\n__l2w_sysv_f:\n    lea rax, [rip + msg]\n    ret\nf:\n    push rbp\n",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+        }
         assert!(
             !out.contains(".type f, @function") && !out.contains(".size") && !out.contains("note")
         );

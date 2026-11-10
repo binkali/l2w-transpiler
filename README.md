@@ -21,16 +21,17 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 | 1 | Rust project, CLI, lexer, parser, diagnostics | ✅ done |
 | 2 | AST → intermediate representation, semantic validation, analysis | ✅ done |
 | 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ✅ done |
-| 4 | Calling-convention compatibility (System V ↔ Windows x64) | ⏳ planned |
+| 4 | Calling-convention compatibility (System V ↔ Windows x64) | ✅ done |
 | 5 | Linux system calls → Windows API runtime layer | ⏳ planned |
 | 6 | Windows code generation, cross-compiling with MinGW-w64 | ⏳ planned |
 | 7 | More tests, error handling, documentation | ⏳ planned |
 
 Right now, translation (`-o`), `--check` (parsing, IR validation and checking that the
 code can be translated to Windows), `--dump-tokens`, `--dump-ast` and `--dump-ir` all work.
-Programs that contain Linux **system calls** (phase 5) or **calls to external functions**
-(phase 4) are still rejected, with an error at each such line. `--compile` follows in
-phase 6.
+Calls to external (Windows/CRT) functions and Windows calls into the program (`main`,
+exported functions) are bridged. Programs that contain Linux **system calls** (phase 5) are
+still rejected, with an error at each such line. `--compile` follows in phase 6; until then
+you can link by hand: `x86_64-w64-mingw32-gcc out.s -o out.exe`.
 Translating (`-o`) and `--compile` stop with a clear "not implemented yet" error
 until phases 3 and 6 are done.
 
@@ -97,10 +98,11 @@ src/
 ├── ir/lower.rs              AST → IR: semantics, validation, sizes
 ├── ir/analysis.rs           functions, calls, syscalls, register values
 ├── transpiler.rs            Linux → Windows passes (sections, addressing, data)
+├── transpiler/bridge.rs     calling-convention bridging pass
 ├── codegen/{mod,windows}.rs Windows/COFF GAS emitter
 ├── compatibility/
 │   ├── syscalls.rs          Linux syscalls → Win32 API             (phase 5)
-│   ├── calling_convention.rs System V ↔ Windows x64                (phase 4)
+│   ├── calling_convention.rs System V ↔ Windows x64 ABI, thunks, wrappers
 │   └── directives.rs        ELF → COFF section mapping
 └── linker.rs                MinGW-w64 assembler/linker driver      (phase 6)
 tests/
@@ -321,6 +323,76 @@ Constants stay constants (`mov rdx, offset len` for an absolute equate).
    from a C harness, and requires output identical to the original code. This covers
    lookups, loops, data pointers, `offset`, `@GOTPCREL`, `@PLT`, commons and numeric labels.
 
+## Calling conventions (phase 4)
+
+| | System V (Linux) | Windows x64 |
+|---|---|---|
+| integer arguments | rdi, rsi, rdx, rcx, r8, r9, then stack | rcx, rdx, r8, r9, then stack |
+| stack arguments at entry | `[rsp + 8]`, … | `[rsp + 40]`, … (after 32 bytes of shadow space) |
+| shadow space | – | 32 bytes, reserved by the caller |
+| red zone | 128 bytes below rsp | none |
+| alignment before `call` | rsp ≡ 0 (mod 16) | rsp ≡ 0 (mod 16) |
+| callee-saved | rbx, rbp, r12–r15 | rbx, rbp, **rsi, rdi**, r12–r15, **xmm6–15** |
+| system calls | `syscall`, rax = number, args in rdi, rsi, rdx, **r10**, r8, r9 | not a stable ABI → Win32 API (phase 5) |
+
+### Strategy: System V inside, bridges at the boundaries
+
+Translated code keeps the System V convention **internally**. Calls between translated
+functions don't change and stay correct. Code is converted only where it crosses between
+the two conventions:
+
+| Boundary | Generated code |
+|---|---|
+| `call puts` / `jmp puts` (tail call) to an **external** function | `call __l2w_thunk_puts`. The thunk moves arguments rdi, rsi, rdx, rcx → rcx, rdx, r8, r9; puts r8, r9 and stack arguments 7–10 into Windows stack slots 5–10; reserves the 32-byte shadow space; forces `and rsp, -16`. Windows callees preserve a superset of the System V callee-saved registers, so nothing else needs saving. |
+| **exported** functions (`.globl`) and `main` (called by the CRT) | The public name becomes a **wrapper** with the Windows convention. It maps arguments back (incl. stack arguments 5–10), saves `rsi`/`rdi`, and calls the System V body `__l2w_sysv_<name>`. Internal calls, jumps and pointers (`.quad f`) are redirected to the body. |
+| `_start` | Entry wrapper `sub rsp, 8; jmp __l2w_sysv__start`: Windows enters the entry point with rsp ≡ 8, Linux with rsp ≡ 0 (mod 16). Reading `argc/argv` from `[rsp]` or `pop` in `_start` is an **error**. |
+
+The argument count is unknown without type information, so every bridge passes on **10
+integer arguments** (6 registers + 4 stack slots). Extra arguments are harmless in both
+conventions, because the caller owns the argument area. Floating-point arguments can't occur,
+since SSE isn't supported. For the same reason translated code never changes `xmm6–15`,
+so wrappers don't have to save them.
+
+### Red zone
+
+gcc `-O0` leaf functions keep locals below `rsp` (`push rbp; mov rbp, rsp;
+mov [rbp-4], edi; …; pop rbp; ret`). On Windows, anything below `rsp` is volatile. When
+`rsp == rbp` holds throughout the function (no other stack operations), `l2w` inserts
+`sub rsp, N` after `mov rbp, rsp` (N = depth rounded up to 16) and replaces `pop rbp`
+with `leave`. Since `rsp == rbp` at that point, `leave` is identical to `pop rbp`.
+Other red-zone use is an **error**, with a hint.
+
+### Rejected / warnings
+
+- External symbols used as **data** or an **address** (`mov rax, [rip + stdout]`,
+  `lea rdi, [rip + puts]`, `.quad malloc`): error. Windows imports these through `__imp_`
+  pointers, and a Windows function called through a pointer expects the Windows convention.
+- **Indirect calls** (`call rax`): warning. The target is assumed to be a System V function
+  of the program.
+- Not handled: passing the address of a translated function to Windows code as a callback
+  (e.g. for `qsort`), structs passed by value, functions with more than 10 arguments, and
+  128-bit return values (rdx:rax).
+
+### Verification on Linux, without Windows
+
+gcc's `__attribute__((ms_abi))` generates Windows-convention calls and functions on Linux.
+`tests/windows.rs` uses that to test the bridges by running them:
+
+- the C harness calls the translated exports **in the Windows convention**, including
+  `sum10` with 10 arguments (stack arguments);
+- `call_ext10` calls an external function with 10 arguments that is written in Windows
+  convention. That function **overwrites its shadow space** (this would crash without the
+  space reserved by the thunk), checks the **stack alignment**, and clobbers r10/r11. The
+  callee-saved `rbx` must survive;
+- a probe calls `clobber` (which modifies rsi/rdi, as System V allows) in Windows
+  convention and checks that **rsi/rdi are preserved**;
+- also tested: the red-zone function `rz_add`, the tail call `jmp ext_twice`, and all
+  phase 3 functions.
+
+All outputs must match the original build. A deliberately broken thunk (no shadow space) is
+caught by the test. On top of that, gcc `-O0` output that uses `printf` can be translated
+and linked with `x86_64-w64-mingw32-gcc` into a working `PE32+` executable.
+
 ### Not supported (yet)
 
 - AT&T syntax and `.intel_syntax prefix` (`%rax`)
@@ -357,10 +429,5 @@ cargo test
   `getpid(39)` → `GetCurrentProcessId`, `exit(60)` → `ExitProcess`. This goes
   through a small runtime layer that maps Linux file descriptors to Windows
   `HANDLE`s and converts return values and error codes (`-errno`).
-- **Red zone via `rbp`:** gcc `-O0` leaf functions store locals at `[rbp - n]` without
-  `sub rsp`. That only works with a red zone; phase 4 will reserve stack space for it.
-- **Calling convention:** argument registers `rdi, rsi, rdx, rcx, r8, r9` →
-  `rcx, rdx, r8, r9` + stack, 32 bytes of shadow space, 16-byte stack alignment, and
-  saving `rsi`/`rdi`/`xmm6–15` (callee-saved on Windows only).
 - If a syscall number isn't statically known, or the semantics can't be preserved,
   `l2w` reports an error.

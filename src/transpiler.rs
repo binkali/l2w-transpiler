@@ -39,6 +39,8 @@ use crate::compatibility::syscalls::linux_syscall_name;
 use crate::diagnostics::{has_errors, Diagnostic, Span};
 use crate::ir::*;
 
+mod bridge;
+
 /// Result of translating a module to Windows.
 #[derive(Debug, Clone)]
 pub struct Translation {
@@ -67,6 +69,7 @@ pub fn transpile(module: &Module) -> Translation {
     t.map_sections();
     t.lower_commons();
     t.rewrite_items();
+    t.bridge_calling_conventions();
     t.check_platform();
     t.diags.sort_by_key(|d| d.span.map(|s| (s.line, s.col)));
     Translation {
@@ -481,17 +484,6 @@ impl Transpiler {
                     .with_help("system calls are mapped to the Windows API in phase 5"),
             );
         }
-        for c in &self.module.platform.calls {
-            if let CallTarget::External(name) = &c.target {
-                self.diags.push(
-                    Diagnostic::error(
-                        format!("call to external function `{name}` is not translated yet"),
-                        c.span,
-                    )
-                    .with_help("System V -> Windows x64 call bridging is implemented in phase 4"),
-                );
-            }
-        }
     }
 }
 
@@ -682,6 +674,11 @@ mod tests {
             e[0].contains("Linux system call `exit` (60) is not translated yet"),
             "{e:?}"
         );
-        assert!(e[1].contains("call to external function `puts`"), "{e:?}");
+        // external calls are bridged since phase 4: no error
+        assert_eq!(
+            t.diagnostics.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{e:?}"
+        );
     }
 }
