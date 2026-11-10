@@ -7,8 +7,7 @@
 //!        --codegen::windows--> GAS/COFF assembly --linker--> .exe (MinGW-w64)
 //! ```
 //!
-//! Phase 1 implements the lexer, parser, AST, diagnostics and CLI. The
-//! remaining modules are placeholders filled in by later phases.
+//! See README.md for the phase-by-phase design.
 
 pub mod ast;
 pub mod cli;

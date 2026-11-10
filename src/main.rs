@@ -1,9 +1,10 @@
 use l2w::cli::{self, Command, Mode, Options};
 use l2w::diagnostics::{Diagnostic, SourceFile};
-use l2w::{ast::StatementKind, codegen, ir, lexer, parser, transpiler};
+use l2w::{ast::StatementKind, codegen, ir, lexer, linker, parser, transpiler};
 use std::process::ExitCode;
 
-/// Exit codes: 0 = success, 1 = errors in the input, 2 = usage or I/O error.
+/// Exit codes: 0 = success, 1 = errors in the input (including assembler or
+/// linker errors), 2 = usage, I/O or toolchain error.
 const EXIT_INPUT_ERROR: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 
@@ -135,12 +136,38 @@ fn run(opts: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Mode::Compile => {
-            let d = Diagnostic::global_error(
-                "assembling and linking a Windows executable is not implemented yet (planned for phase 6)",
-            )
-            .with_help("use `-o output.s` to write the Windows assembly");
-            eprint!("{}", d.render(&file));
-            ExitCode::from(EXIT_INPUT_ERROR)
+            let exe = opts
+                .output
+                .clone()
+                .expect("--compile always has an output path");
+            let plan = match linker::plan(&translation, &opts.libs) {
+                Ok(p) => p,
+                Err(d) => return report(&file, &[d]),
+            };
+            let asm = codegen::windows::emit(&translation, &file.name);
+            let kept = opts.keep_asm.then(|| exe.with_extension("s"));
+            if kept.as_deref() == Some(opts.input.as_path()) {
+                eprintln!(
+                    "error: --keep-asm would overwrite the input `{}`; choose another -o",
+                    opts.input.display()
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+            match linker::build(&asm, &plan, &exe, kept.as_deref(), &verbose) {
+                Ok(()) => {
+                    if let Some(k) = &kept {
+                        verbose(&format!("kept {}", k.display()));
+                    }
+                    let size = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+                    verbose(&format!("wrote {} ({size} bytes)", exe.display()));
+                    ExitCode::SUCCESS
+                }
+                Err(linker::LinkError::Build(d)) => report(&file, &[d]),
+                Err(linker::LinkError::Tool(d)) => {
+                    eprint!("{}", d.render(&file));
+                    ExitCode::from(EXIT_USAGE)
+                }
+            }
         }
         Mode::DumpTokens | Mode::DumpAst | Mode::DumpIr => unreachable!(),
     }

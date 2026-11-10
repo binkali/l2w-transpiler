@@ -23,18 +23,14 @@ source ─lexer─▶ tokens ─parser─▶ AST ─▶ IR ─transpiler─▶ W
 | 3 | Translating ordinary instructions and GAS directives, ELF → COFF sections | ✅ done |
 | 4 | Calling-convention compatibility (System V ↔ Windows x64) | ✅ done |
 | 5 | Linux system calls → Windows API runtime layer | ✅ done |
-| 6 | Windows code generation, cross-compiling with MinGW-w64 | ⏳ planned |
+| 6 | Windows code generation, cross-compiling with MinGW-w64 | ✅ done |
 | 7 | More tests, error handling, documentation | ⏳ planned |
 
-Right now, translation (`-o`), `--check` (parsing, IR validation and checking that the
+Everything up to a Windows executable works: translation (`-o`), `--compile`, `--check` (parsing, IR validation and checking that the
 code can be translated to Windows), `--dump-tokens`, `--dump-ast` and `--dump-ir` all work.
 Calls to external (Windows/CRT) functions and Windows calls into the program (`main`,
 exported functions) are bridged, and Linux **system calls** are implemented on top of the
-Win32 API. `--compile` follows in phase 6. Until then you can link by hand:
-`x86_64-w64-mingw32-gcc out.s -o out.exe` for programs with `main`, or
-`x86_64-w64-mingw32-gcc -nostdlib -e _start out.s -lkernel32 -o out.exe` for `_start` programs.
-Translating (`-o`) and `--compile` stop with a clear "not implemented yet" error
-until phases 3 and 6 are done.
+Win32 API. `--compile` assembles and links with MinGW-w64 into a `.exe`.
 
 ## Building
 
@@ -50,7 +46,9 @@ cargo build --release
 ```bash
 l2w input.s -o output.s                    # translate to Windows assembly (stdout without -o)
 l2w input.s -o output.s --target windows   # same; windows is the default
-l2w input.s --compile -o output.exe        # translate + assemble + link (phase 6+)
+l2w input.s --compile -o output.exe        # translate + assemble + link with MinGW-w64
+l2w input.s --compile                      # output: input.exe
+l2w input.s --compile -l user32 --keep-asm # extra library; keep output.s next to the .exe
 l2w input.s --check                        # parse/analyze only, report diagnostics
 l2w input.s --check --verbose              # with progress information
 l2w input.s --dump-tokens                  # print the lexer's token stream
@@ -58,7 +56,8 @@ l2w input.s --dump-ast                     # print the parsed AST
 l2w input.s --dump-ir                      # print IR analysis + normalized listing
 ```
 
-Exit codes: `0` success, `1` errors in the input, `2` usage or I/O error.
+Exit codes: `0` success, `1` errors in the input (including assembler/linker errors such as
+undefined references), `2` usage, I/O or toolchain error (MinGW-w64 missing).
 
 ### Example diagnostics
 
@@ -106,7 +105,7 @@ src/
 │   ├── syscalls.rs          Linux syscalls → Win32 API shims, fd table
 │   ├── calling_convention.rs System V ↔ Windows x64 ABI, thunks, wrappers
 │   └── directives.rs        ELF → COFF section mapping
-└── linker.rs                MinGW-w64 assembler/linker driver      (phase 6)
+└── linker.rs                MinGW-w64 driver: discovery, entry point, link command
 tests/
 ├── cli.rs                   end-to-end tests of the binary
 ├── roundtrip.rs             AST/IR → listing → `as` object comparison
@@ -505,8 +504,36 @@ cargo test
   semantics (memory vs. immediate, inferred sizes, equate order, numeric labels, `offset`)
   match GAS exactly. The test is skipped if `as`/`objdump` aren't installed.
 
-## Next: phase 6
+## Building executables (phase 6)
 
-`--compile` runs `x86_64-w64-mingw32-as`/`-gcc` itself: it picks the entry point (`main`
-with the C runtime, or `-nostdlib -e _start -lkernel32`), checks that the tools are
-installed (with installation hints), and passes on diagnostics.
+`--compile` writes the Windows assembly to a temporary file (or, with `--keep-asm`, to
+`<output>.s`) and calls the MinGW-w64 GCC driver:
+
+| Entry point | Command |
+|---|---|
+| `main` (C runtime) | `x86_64-w64-mingw32-gcc prog.s -o prog.exe` |
+| `_start` | `x86_64-w64-mingw32-gcc -nostdlib -e _start prog.s -o prog.exe [-lmsvcrt] -lkernel32` |
+
+- `_start` programs get **no** C runtime startup. The system-call shims only need
+  kernel32. If the program calls external functions (e.g. `puts`), `msvcrt` is linked
+  too. `msvcrt.dll` initializes itself when it is loaded.
+- No entry point (`_start` or `main`) → error with a hint (`-o out.s` for libraries).
+- **Compiler discovery:** `$L2W_CC`, otherwise `x86_64-w64-mingw32-gcc` (on Windows also
+  `gcc`). Each candidate is checked with `-dumpmachine`: a compiler that doesn't target
+  `x86_64-*-mingw*`/`windows` (e.g. the host `gcc` on Linux) is **refused** instead of
+  silently building a Linux binary. If none is found: exit code 2 with installation hints
+  for Debian/Ubuntu/Kali, Fedora, Arch, macOS, and MSYS2.
+- **Linker errors** are passed on. For `undefined reference to `x'`, `l2w` adds a hint
+  saying which libraries were linked and that `-l <name>` adds more.
+- `--verbose` shows the compiler found, the full command, and the size of the `.exe`.
+
+`tests/cli.rs` builds `hello`, `loop`, `functions`, and a gcc `-O0` C program that uses
+`printf`. It checks the PE header (`MZ`, `PE\0\0`, machine AMD64) and the imports
+(`_start` programs: **only `KERNEL32.dll`**). If Wine is installed, the test also runs the
+`.exe` files and compares their output. It also tests a missing compiler, a host `gcc`
+given via `L2W_CC`, an undefined symbol, and a missing entry point.
+
+## Next: phase 7
+
+More tests on real Windows/Wine, more instructions (`setcc`, `cmovcc`, string
+instructions), and more system calls (`lseek`, `fstat`, `mmap` → `VirtualAlloc`).
