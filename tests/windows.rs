@@ -220,7 +220,15 @@ fn mingw_assembles_translations_without_absolute_32bit_relocations() {
         );
         return;
     }
-    for (name, src) in [("library", LIBRARY), ("extra", EXTRA), ("bridge", BRIDGE)] {
+    for (name, src) in [
+        ("library", LIBRARY),
+        ("extra", EXTRA),
+        ("bridge", BRIDGE),
+        ("hello", HELLO),
+        ("loop", LOOP),
+        ("functions", FUNCTIONS),
+        ("syscalls", SYSCALLS),
+    ] {
         let asm = translate(src, name);
         let s = dir().join(format!("{name}.win.s"));
         let o = dir().join(format!("{name}.win.o"));
@@ -382,5 +390,337 @@ fn translated_code_behaves_like_the_original() {
             original.contains(expected),
             "missing {expected:?}:\n{original}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: system calls. The translated programs call the Win32 API; on Linux
+// they are linked against WIN32_MOCK, an ms_abi implementation of the used
+// kernel32 functions on top of POSIX. The mock checks the Windows calling
+// convention at every call (16-byte alignment), writes its arguments into
+// the caller's shadow space (gcc -O0) and clobbers all volatile registers.
+
+const HELLO: &str = include_str!("../examples/hello.s");
+const LOOP: &str = include_str!("../examples/loop.s");
+const FUNCTIONS: &str = include_str!("../examples/functions.s");
+
+/// File I/O semantics: lowest-free fd allocation, O_TRUNC/O_APPEND/O_EXCL,
+/// -errno results (EBADF for wrong access mode or closed fds, EEXIST,
+/// ENOENT), register and flag preservation across `syscall`, and
+/// `exit` status truncation to 8 bits.
+const SYSCALLS: &str = r#"
+.intel_syntax noprefix
+.section .rodata
+path:    .asciz "l2w-sys.txt"
+missing: .asciz "l2w-missing/none.txt"
+first:   .ascii "abc\n"
+second:  .ascii "def\n"
+.bss
+buf:     .zero 64
+res:     .zero 16
+.text
+.globl _start
+_start:
+    mov eax, 2                  # open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    lea rdi, [rip + path]
+    mov esi, 0x241
+    mov edx, 0x1a4
+    syscall
+    mov r12, rax                # 3: lowest free fd
+    mov eax, 1                  # write(fd, "abc\n", 4)
+    mov rdi, r12
+    lea rsi, [rip + first]
+    mov edx, 4
+    syscall
+    mov r13, rax                # 4
+    xor eax, eax                # read on a write-only fd
+    mov rdi, r12
+    lea rsi, [rip + buf]
+    mov edx, 64
+    syscall
+    mov r14, rax                # -EBADF
+    mov eax, 3                  # close(fd)
+    mov rdi, r12
+    syscall
+    add r14, rax                # + 0
+    mov eax, 1                  # write to the closed fd
+    mov rdi, r12
+    lea rsi, [rip + first]
+    mov edx, 4
+    syscall
+    mov r15, rax                # -EBADF
+    mov eax, 2                  # open(path, O_WRONLY|O_APPEND)
+    lea rdi, [rip + path]
+    mov esi, 0x401
+    syscall
+    mov rbx, rax
+    mov eax, 1
+    mov rdi, rbx
+    lea rsi, [rip + second]
+    mov edx, 4
+    syscall
+    mov eax, 3
+    mov rdi, rbx
+    syscall
+    mov eax, 2                  # open(path, O_WRONLY|O_CREAT|O_EXCL) -> -EEXIST
+    lea rdi, [rip + path]
+    mov esi, 0xc1
+    mov edx, 0x1a4
+    syscall
+    mov qword ptr [rip + res], rax
+    mov eax, 2                  # open(missing, O_RDONLY) -> -ENOENT
+    lea rdi, [rip + missing]
+    xor esi, esi
+    syscall
+    mov qword ptr [rip + res + 8], rax
+    mov eax, 2                  # read the file back and print it
+    lea rdi, [rip + path]
+    xor esi, esi
+    syscall
+    mov rbx, rax
+    xor eax, eax
+    mov rdi, rbx
+    lea rsi, [rip + buf]
+    mov edx, 64
+    syscall
+    mov rdx, rax                # 8 bytes: "abc\ndef\n"
+    mov eax, 1
+    mov edi, 1
+    lea rsi, [rip + buf]
+    syscall
+    mov eax, 1                  # write to a read-only fd -> -EBADF
+    mov rdi, rbx
+    lea rsi, [rip + buf]
+    mov edx, 1
+    syscall
+    add r15, rax
+    mov eax, 3
+    mov rdi, rbx
+    syscall
+    mov eax, 3                  # close(200) -> -EBADF
+    mov edi, 200
+    syscall
+    add r15, rax
+    mov r8, 0x1111              # registers and flags survive a syscall
+    mov r9, 0x2222
+    mov r10, 0x3333
+    mov rsi, 0x4444
+    mov edi, 1
+    xor edx, edx
+    mov eax, 39
+    cmp eax, 39                 # ZF = 1
+    syscall                     # getpid
+    jne fail
+    test rax, rax
+    jle fail
+    cmp r8, 0x1111
+    jne fail
+    cmp r9, 0x2222
+    jne fail
+    cmp r10, 0x3333
+    jne fail
+    cmp rsi, 0x4444
+    jne fail
+    test rdx, rdx
+    jne fail
+    cmp rdi, 1
+    jne fail
+    mov eax, 1                  # write(1, buf, 0) -> 0
+    syscall
+    test rax, rax
+    jne fail
+    # status = 256 + 3 + 4 + 9 + 27 + 17 + 2 = 318; Linux reports 318 & 0xff = 62
+    lea rdi, [r12 + 256]
+    add rdi, r13
+    sub rdi, r14
+    sub rdi, r15
+    sub rdi, qword ptr [rip + res]
+    sub rdi, qword ptr [rip + res + 8]
+    mov eax, 60
+    syscall
+fail:
+    mov eax, 60
+    mov edi, 1
+    syscall
+.section .note.GNU-stack,"",@progbits
+"#;
+
+const WIN32_MOCK: &str = r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#define WINAPI __attribute__((ms_abi))
+#define H(fd) ((void *)(intptr_t)((fd) + 0x1000))
+#define FD(h) ((int)((intptr_t)(h) - 0x1000))
+
+static uint32_t last_error;
+
+/* At -O0 rbp = entry rsp - 8, so a correctly aligned call gives rbp % 16 == 0.
+   gcc -O0 spills ms_abi register arguments into the caller's shadow space
+   ([rbp + 16, rbp + 48)), so a missing shadow space corrupts the caller.
+   Volatile registers are clobbered as a real Windows function may do. */
+#define CHECK do { \
+    uint64_t *fp = __builtin_frame_address(0); \
+    if ((uintptr_t)fp & 15) { write(2, "misaligned call\n", 16); _exit(99); } \
+    __asm__ volatile("mov $-1, %%r10\n mov $-1, %%r11\n mov $-1, %%r8\n mov $-1, %%r9\n mov $-1, %%rdx" \
+                     ::: "r8", "r9", "r10", "r11", "rdx"); \
+} while (0)
+
+static uint32_t win_error(int e) {
+    switch (e) {
+    case ENOENT: return 2;      case EMFILE: return 4;   case EACCES: return 5;
+    case EBADF: return 6;       case EEXIST: return 80;  case EINVAL: return 87;
+    case EPIPE: return 109;     case ENOSPC: return 112; case ENAMETOOLONG: return 206;
+    default: return 31;
+    }
+}
+
+WINAPI void *GetStdHandle(uint32_t n) {
+    CHECK;
+    switch ((int32_t)n) { case -10: return H(0); case -11: return H(1); case -12: return H(2); }
+    return (void *)-1;
+}
+WINAPI uint32_t GetLastError(void) { CHECK; return last_error; }
+WINAPI int ReadFile(void *h, void *buf, uint32_t n, uint32_t *got, void *ov) {
+    CHECK;
+    if (ov) abort();
+    ssize_t r = read(FD(h), buf, n);
+    if (r < 0) { last_error = win_error(errno); *got = 0; return 0; }
+    *got = (uint32_t)r; return 1;
+}
+WINAPI int WriteFile(void *h, const void *buf, uint32_t n, uint32_t *put, void *ov) {
+    CHECK;
+    if (ov) abort();
+    ssize_t r = write(FD(h), buf, n);
+    if (r < 0) { last_error = win_error(errno); *put = 0; return 0; }
+    *put = (uint32_t)r; return 1;
+}
+WINAPI void *CreateFileA(const char *path, uint32_t access, uint32_t share, void *sa,
+                         uint32_t disp, uint32_t attrs, void *tmpl) {
+    CHECK;
+    if (share != 7 || sa || tmpl || (attrs != 0x80 && attrs != 1)) abort();
+    int fl;
+    switch (access) {
+    case 0x80000000u: fl = O_RDONLY; break;
+    case 0x40000000u: fl = O_WRONLY; break;
+    case 0xC0000000u: fl = O_RDWR; break;
+    default: abort();
+    }
+    switch (disp) {
+    case 1: fl |= O_CREAT | O_EXCL; break;   /* CREATE_NEW */
+    case 2: fl |= O_CREAT | O_TRUNC; break;  /* CREATE_ALWAYS */
+    case 3: break;                           /* OPEN_EXISTING */
+    case 4: fl |= O_CREAT; break;            /* OPEN_ALWAYS */
+    case 5: fl |= O_TRUNC; break;            /* TRUNCATE_EXISTING */
+    default: abort();
+    }
+    int fd = open(path, fl, attrs == 1 ? 0444 : 0666);
+    if (fd < 0) { last_error = win_error(errno); return (void *)-1; }
+    return H(fd);
+}
+WINAPI int CloseHandle(void *h) {
+    CHECK;
+    if (close(FD(h)) < 0) { last_error = win_error(errno); return 0; }
+    return 1;
+}
+WINAPI int SetFilePointerEx(void *h, int64_t dist, int64_t *pos, uint32_t method) {
+    CHECK;
+    off_t r = lseek(FD(h), dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
+    if (r < 0) { last_error = win_error(errno); return 0; }
+    if (pos) *pos = r;
+    return 1;
+}
+WINAPI uint32_t GetCurrentProcessId(void) { CHECK; return (uint32_t)getpid(); }
+WINAPI void ExitProcess(uint32_t code) { CHECK; _exit((int)code); }
+
+/* The Windows loader calls the entry point like a function. */
+WINAPI void l2w_entry(void);
+int main(void) { l2w_entry(); return 111; }
+"#;
+
+/// Renames the symbol `_start` (not `__l2w_sysv__start`) so the translated
+/// entry point does not clash with the C runtime's `_start`.
+fn rename_entry(asm: &str) -> String {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$';
+    let mut out = String::new();
+    let mut rest = asm;
+    while let Some(i) = rest.find("_start") {
+        let before = rest[..i].chars().last();
+        let after = rest[i + 6..].chars().next();
+        out += &rest[..i];
+        if before.map_or(true, |c| !ident(c)) && after.map_or(true, |c| !ident(c)) {
+            out += "l2w_entry";
+        } else {
+            out += "_start";
+        }
+        rest = &rest[i + 6..];
+    }
+    out + rest
+}
+
+/// Runs `exe` in a fresh directory, returns (stdout, exit code).
+fn run_in(exe: &Path, cwd: &Path) -> (String, i32) {
+    let _ = std::fs::remove_dir_all(cwd);
+    std::fs::create_dir_all(cwd).unwrap();
+    let out = Command::new(exe).current_dir(cwd).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{exe:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().expect("exited normally"),
+    )
+}
+
+#[test]
+fn translated_syscalls_behave_like_linux() {
+    if !available("gcc") {
+        eprintln!("skipping: gcc not available");
+        return;
+    }
+    let d = dir().join("syscalls");
+    std::fs::create_dir_all(&d).unwrap();
+    let mock = d.join("win32_mock.c");
+    std::fs::write(&mock, WIN32_MOCK).unwrap();
+    for (name, src) in [
+        ("hello", HELLO),
+        ("loop", LOOP),
+        ("functions", FUNCTIONS),
+        ("syscalls", SYSCALLS),
+    ] {
+        // Original: a static Linux executable.
+        let orig_s = d.join(format!("{name}.s"));
+        std::fs::write(&orig_s, src).unwrap();
+        let orig = d.join(format!("{name}-linux"));
+        run(Command::new("gcc")
+            .args(["-nostdlib", "-static", "-no-pie", "-o"])
+            .arg(&orig)
+            .arg(&orig_s));
+        // Translated: Windows code + Win32 mock.
+        let tr_s = d.join(format!("{name}-win.s"));
+        std::fs::write(
+            &tr_s,
+            rename_entry(&coff_to_elf_sections(&translate(src, name))),
+        )
+        .unwrap();
+        let tr = d.join(format!("{name}-win"));
+        run(Command::new("gcc")
+            .args(["-no-pie", "-O0", "-fno-omit-frame-pointer", "-o"])
+            .arg(&tr)
+            .arg(&mock)
+            .arg(&tr_s));
+        let expected = run_in(&orig, &d.join(format!("{name}-run-linux")));
+        let actual = run_in(&tr, &d.join(format!("{name}-run-win")));
+        assert_eq!(expected, actual, "{name}");
+        if name == "syscalls" {
+            assert_eq!(expected, ("abc\ndef\n".to_string(), 62));
+        }
+        if name == "hello" {
+            assert_eq!(expected.0, "Hello, World!\n");
+        }
     }
 }

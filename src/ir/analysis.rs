@@ -207,7 +207,7 @@ fn effect(module: &Module, ins: &Instr, here: Loc, reg: u8, depth: u32) -> Optio
         Cbw | Cwde | Cdqe => &[0],
         Cwd | Cdq | Cqo => &[2],
         Leave => &[4, 5],
-        Push | Pop => &[4],
+        Push | Pop | Pushfq | Popfq => &[4],
         Xchg => {
             let touches = ins
                 .operands

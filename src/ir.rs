@@ -180,12 +180,15 @@ pub enum Mnemonic {
     Push,
     Pop,
     Leave,
+    /// `pushfq`/`popfq`: push/pop RFLAGS.
+    Pushfq,
+    Popfq,
     Nop,
     Syscall,
 }
 
 /// Mnemonics accepted by [`Mnemonic::parse`] (for help messages).
-pub const SUPPORTED_MNEMONICS: &str = "mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop leave nop syscall";
+pub const SUPPORTED_MNEMONICS: &str = "mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall";
 
 impl Mnemonic {
     pub fn parse(s: &str) -> Option<Mnemonic> {
@@ -227,6 +230,8 @@ impl Mnemonic {
             "push" => Push,
             "pop" => Pop,
             "leave" => Leave,
+            "pushfq" | "pushf" => Pushfq,
+            "popfq" | "popf" => Popfq,
             "nop" => Nop,
             "syscall" => Syscall,
             _ => return s.strip_prefix('j').and_then(Cond::parse).map(Jcc),
@@ -273,6 +278,8 @@ impl Mnemonic {
             Push => "push",
             Pop => "pop",
             Leave => "leave",
+            Pushfq => "pushfq",
+            Popfq => "popfq",
             Nop => "nop",
             Syscall => "syscall",
         })

@@ -1397,7 +1397,7 @@ fn validate(
                 None
             }
         }
-        Cbw | Cwde | Cdqe | Cwd | Cdq | Cqo | Leave | Syscall => {
+        Cbw | Cwde | Cdqe | Cwd | Cdq | Cqo | Leave | Pushfq | Popfq | Syscall => {
             arity(m, ops, &[0], span)?;
             None
         }
