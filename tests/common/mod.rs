@@ -266,12 +266,80 @@ pub fn linux_and_windows(name: &str, asm: &str, c_ext: &str) -> Option<(Outcome,
     ))
 }
 
-/// Asserts that both builds behave identically and returns the outcome.
+/// Asserts that the builds behave identically — Linux original, translation
+/// on the Win32 mock and, if available, the translated `.exe` under Wine —
+/// and returns the outcome.
 pub fn same_behavior(name: &str, asm: &str, c_ext: &str) -> Option<Outcome> {
     let (linux, windows) = linux_and_windows(name, asm, c_ext)?;
     assert_eq!(
         linux, windows,
-        "{name}: Linux original vs. translated Windows build"
+        "{name}: Linux original vs. translated build (Win32 mock)"
     );
+    if let Some(wine) = wine_outcome(name, asm, c_ext) {
+        assert_eq!(
+            linux, wine,
+            "{name}: Linux original vs. translated .exe under Wine"
+        );
+    }
     Some(linux)
+}
+
+/// `true` if Windows executables can be built (MinGW-w64) and run (Wine).
+pub fn wine_available() -> bool {
+    available("x86_64-w64-mingw32-gcc")
+        && Command::new("wine")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Builds the l2w translation of `asm` as a real Windows executable
+/// (MinGW-w64, `-nostdlib -e _start -lkernel32`, `c_ext` compiled natively
+/// for Windows) and runs it under Wine in a fresh directory. Returns
+/// `None` if MinGW-w64 or Wine is missing.
+pub fn wine_outcome(name: &str, asm: &str, c_ext: &str) -> Option<Outcome> {
+    if !wine_available() {
+        eprintln!("skipping Wine run of {name}: MinGW-w64 or Wine not available");
+        return None;
+    }
+    let d = dir().join("wine").join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    let ext = d.join("ext.c");
+    std::fs::write(&ext, format!("#include <stdint.h>\n{c_ext}")).unwrap();
+    let s = d.join("prog.s");
+    std::fs::write(&s, translate(asm, name)).unwrap();
+    let exe = d.join("prog.exe");
+    run(Command::new("x86_64-w64-mingw32-gcc")
+        .args([
+            "-nostdlib",
+            "-e",
+            "_start",
+            "-O0",
+            "-fno-omit-frame-pointer",
+            "-ffreestanding",
+            "-DWIN",
+            "-DABI=",
+        ])
+        .args([
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-o",
+        ])
+        .arg(&exe)
+        .arg(&s)
+        .arg(&ext)
+        .arg("-lkernel32"));
+    let cwd = d.join("run");
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = Command::new("wine")
+        .arg(&exe)
+        .current_dir(&cwd)
+        .env("WINEDEBUG", "-all")
+        .output()
+        .unwrap();
+    Some((
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().expect("wine exited normally"),
+    ))
 }

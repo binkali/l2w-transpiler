@@ -51,7 +51,7 @@ wine hello.exe                                           # or run it on Windows
 | Operands | registers (8–64 bit, `ah`–`dh`), immediates (range-checked), all memory forms, `offset`, `rip`-relative | invalid scale/index, size mismatches, ambiguous sizes, `ah` with REX, `fs:`/`gs:` (TLS) | – |
 | Addressing | `[sym]` → `[rip + sym]`, `mov r64, offset sym` → `lea`, `@GOTPCREL`/`@PLT` resolved | `[reg + sym]`, `.long sym`, `push offset sym` (32-bit absolute addresses), red zone below `rsp` | – |
 | Sections | `.text .data .bss .rodata(.X) .data.rel.ro` → `.text .data .bss .rdata`, `.comm`/`.lcomm` → `.bss`, notes/debug dropped | `.init_array`, `.fini_array`, `.ctors`, TLS (`.tdata`/`.tbss`), `.eh_frame`, hand-written `.got`/`.plt` | – |
-| Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args |
+| Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args; **`long` is 32-bit on Windows (LLP64)**: external C functions with `long` parameters/results (e.g. `printf("%ld")`, `labs`) see only the low 32 bits. Assembly has no types, so this can't be detected. |
 | System calls | `read write open close getpid exit exit_group` via Win32 shims (registers + RFLAGS preserved, `-errno`) | unknown syscall numbers, unsupported calls (`mmap`, `fork`, …), untranslatable static `open` flags | `close(0/1/2)` keeps the handle; no `SIGPIPE`; console `\r\n`; absolute paths are relative to the current drive |
 | Build | `--compile` with MinGW-w64 (`main` → C runtime, `_start` → `-nostdlib -lkernel32`) | missing/non-Windows compiler (exit 2, install hints), linker errors (exit 1, hints) | – |
 | Robustness | – | input that would exhaust resources: expressions nested > 64 levels or with > 1000 operators, equate chains > 100 | – |
@@ -393,6 +393,11 @@ Other red-zone use is an **error**, with a hint.
   pointers, and a Windows function called through a pointer expects the Windows convention.
 - **Indirect calls** (`call rax`): warning. The target is assumed to be a System V function
   of the program.
+- **Data model:** Linux is LP64, Windows is LLP64, so `long` is 64 bits on Linux and 32 bits on
+  Windows. Registers are passed through unchanged, but a Windows C function declared with
+  `long` only uses the low 32 bits (`printf("%ld")` prints `int`s). The assembly contains no
+  type information, so `l2w` can't detect this. Use `long long`/`int64_t`/`%lld` functions
+  for 64-bit values.
 - Not handled: passing the address of a translated function to Windows code as a callback
   (e.g. for `qsort`), structs passed by value, functions with more than 10 arguments, and
   128-bit return values (rdx:rax).
@@ -522,6 +527,12 @@ L2W_BLESS=1 cargo test --test spec golden   # regenerate the expected diagnostic
 Tests that need external tools (GNU `as`, `gcc`, MinGW-w64, Wine) skip themselves
 with a message if the tool is missing.
 
+**With Wine installed**, every behavioral test also builds the translation as a real `.exe`
+(MinGW-w64, `-nostdlib -lkernel32`) and runs it under Wine, i.e. against the real
+kernel32 implementation (PE loader, `CreateFileA`, `WriteFile`, Windows error codes). Its
+output and exit status must match the Linux original as well: Linux original =
+translation on the Win32 mock = translated `.exe` under Wine.
+
 | Suite | What it shows |
 |---|---|
 | unit tests (`src/**`) | lexer, parser, IR lowering and validation, analysis, every transpiler pass, shim generation, link plans, CLI parsing, diagnostic rendering |
@@ -533,10 +544,11 @@ with a message if the tool is missing.
 
 ### Specification test matrix (`tests/spec.rs`)
 
-Each behavioral test builds its program twice: the **original** as a static Linux
-executable, and the **translation** linked against the Win32 mock, with external C functions
-compiled with `ms_abi`, i.e. with real Windows calling-convention semantics. Both must
-produce **the same stdout and exit status**.
+Each behavioral test builds its program up to three times: the **original** as a static
+Linux executable; the **translation** linked against the Win32 mock, with external C functions
+compiled with `ms_abi`, i.e. with real Windows calling-convention semantics; and, if Wine is
+available, the translation as a **real Windows `.exe` under Wine**. All of them must produce
+**the same stdout and exit status**.
 
 | # | Requirement | Test | Covers |
 |---|---|---|---|

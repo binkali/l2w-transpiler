@@ -528,6 +528,10 @@ fn translated_syscalls_behave_like_linux() {
         let expected = run_in(&orig, &d.join(format!("{name}-run-linux")));
         let actual = run_in(&tr, &d.join(format!("{name}-run-win")));
         assert_eq!(expected, actual, "{name}");
+        // The same translation as a real .exe against Wine's kernel32.
+        if let Some(wine) = wine_outcome(name, src, "") {
+            assert_eq!(expected, wine, "{name}: under Wine");
+        }
         if name == "syscalls" {
             assert_eq!(expected, ("abc\ndef\n".to_string(), 62));
         }
