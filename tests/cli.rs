@@ -154,11 +154,193 @@ fn transpile_writes_windows_assembly() {
     assert!(String::from_utf8_lossy(&o.stdout).contains(".intel_syntax noprefix"));
 }
 
+fn tool_works(tool: &str, arg: &str) -> bool {
+    Command::new(tool)
+        .arg(arg)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn l2w_env(args: &[&str], key: &str, value: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_l2w"))
+        .args(args)
+        .env(key, value)
+        .output()
+        .expect("run l2w")
+}
+
+/// PE imports (DLL names) of an executable, via MinGW objdump.
+fn imported_dlls(exe: &Path) -> Option<Vec<String>> {
+    let out = Command::new("x86_64-w64-mingw32-objdump")
+        .arg("-p")
+        .arg(exe)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix("DLL Name: "))
+            .map(|s| s.to_ascii_uppercase())
+            .collect(),
+    )
+}
+
 #[test]
-fn compile_is_rejected_until_implemented() {
-    let o = l2w(&["examples/library.s", "--compile", "-o", "/dev/null"]);
+fn compile_builds_windows_executables() {
+    if !tool_works("x86_64-w64-mingw32-gcc", "-dumpmachine") {
+        eprintln!("skipping: MinGW-w64 not installed");
+        return;
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let wine = tool_works("wine", "--version");
+    for (ex, expected) in [
+        ("hello", "Hello, World!\n"),
+        ("loop", ""),
+        ("functions", ""),
+    ] {
+        let exe = dir.join(format!("{ex}.exe"));
+        let _ = std::fs::remove_file(&exe);
+        let o = l2w(&[
+            &format!("examples/{ex}.s"),
+            "--compile",
+            "-o",
+            exe.to_str().unwrap(),
+        ]);
+        assert_eq!(o.status.code(), Some(0), "{ex}: {}", stderr(&o));
+        let bytes = std::fs::read(&exe).unwrap();
+        assert_eq!(&bytes[..2], b"MZ", "{ex}");
+        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "{ex}");
+        assert_eq!(
+            u16::from_le_bytes([bytes[pe + 4], bytes[pe + 5]]),
+            0x8664,
+            "{ex}: AMD64 machine"
+        );
+        if let Some(dlls) = imported_dlls(&exe) {
+            assert_eq!(dlls, ["KERNEL32.DLL"], "{ex}");
+        }
+        if wine && !expected.is_empty() {
+            let out = Command::new("wine").arg(&exe).output().unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+                expected
+            );
+        }
+    }
+
+    // --keep-asm keeps the Windows assembly next to the executable.
+    let exe = dir.join("kept.exe");
+    let o = l2w(&[
+        "examples/hello.s",
+        "--compile",
+        "-o",
+        exe.to_str().unwrap(),
+        "--keep-asm",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let asm = std::fs::read_to_string(dir.join("kept.s")).unwrap();
+    assert!(asm.contains("call __l2w_sys_write"), "{asm}");
+
+    // A `main` program using the C runtime (gcc -O0 output with printf).
+    if tool_works("gcc", "--version") {
+        let c = dir.join("prog.c");
+        std::fs::write(&c, "#include <stdio.h>\nstatic long t[4];\nint add(int a, int b) { int c = a + b; return c; }\n\
+                            int main(void) { for (int i = 0; i < 4; i++) t[i] = add(i, i); printf(\"%ld\\n\", t[3]); return 0; }\n").unwrap();
+        let s = dir.join("prog.s");
+        let gcc = Command::new("gcc")
+            .args([
+                "-O0",
+                "-S",
+                "-masm=intel",
+                "-fno-asynchronous-unwind-tables",
+                "-fcf-protection=none",
+                "-fno-stack-protector",
+                "-o",
+            ])
+            .arg(&s)
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert!(gcc.status.success());
+        let exe = dir.join("prog.exe");
+        let o = l2w(&[
+            s.to_str().unwrap(),
+            "--compile",
+            "-o",
+            exe.to_str().unwrap(),
+        ]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        if let Some(dlls) = imported_dlls(&exe) {
+            assert!(
+                dlls.iter()
+                    .any(|d| d.contains("MSVCRT") || d.starts_with("API-MS-WIN-CRT")),
+                "{dlls:?}"
+            );
+        }
+        if wine {
+            let out = Command::new("wine").arg(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "6");
+        }
+    }
+
+    // Undefined external: linker error with a hint, exit code 1.
+    let p = write_temp(
+        "undef.s",
+        ".globl _start\n_start:\n    call frobnicate\n    mov eax, 60\n    syscall\n",
+    );
+    let o = l2w(&[
+        p.to_str().unwrap(),
+        "--compile",
+        "-o",
+        dir.join("undef.exe").to_str().unwrap(),
+    ]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(stderr(&o).contains("not implemented yet"));
+    let e = stderr(&o);
+    assert!(
+        e.contains("undefined reference to `frobnicate'")
+            && e.contains("`frobnicate` is not defined"),
+        "{e}"
+    );
+}
+
+#[test]
+fn compile_reports_toolchain_and_entry_problems() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compile");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("never.exe");
+    let exe = exe.to_str().unwrap();
+    // Missing compiler: exit code 2 with installation hints.
+    let o = l2w_env(
+        &["examples/hello.s", "--compile", "-o", exe],
+        "L2W_CC",
+        "/nonexistent/l2w-cc",
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let e = stderr(&o);
+    assert!(
+        e.contains("no MinGW-w64 compiler found") && e.contains("apt install gcc-mingw-w64-x86-64"),
+        "{e}"
+    );
+    // A compiler that does not target Windows is refused.
+    if tool_works("gcc", "-dumpmachine") {
+        let o = l2w_env(
+            &["examples/hello.s", "--compile", "-o", exe],
+            "L2W_CC",
+            "gcc",
+        );
+        assert_eq!(o.status.code(), Some(2));
+        assert!(
+            stderr(&o).contains("no Windows-targeting compiler found: `gcc` targets"),
+            "{}",
+            stderr(&o)
+        );
+    }
+    // No entry point.
+    let o = l2w(&["examples/library.s", "--compile", "-o", exe]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("no entry point"));
+    assert!(!Path::new(exe).exists());
 }
 
 #[test]

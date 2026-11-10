@@ -3,7 +3,7 @@
 //! ```text
 //! l2w input.s -o output.s
 //! l2w input.s -o output.s --target windows
-//! l2w input.s --compile -o output.exe
+//! l2w input.s --compile -o output.exe [-l user32] [--keep-asm]
 //! l2w input.s --check
 //! l2w input.s --verbose
 //! ```
@@ -24,7 +24,10 @@ OPTIONS:
     -o, --output <FILE>     Output file (.s when transpiling, .exe with --compile).
                             Without -o, transpiled assembly is written to stdout.
         --target <TARGET>   Target platform [default: windows] [possible: windows]
-        --compile           Transpile, assemble and link into a Windows .exe (MinGW-w64)
+        --compile           Transpile, assemble and link into a Windows .exe (MinGW-w64;
+                            compiler: x86_64-w64-mingw32-gcc or $L2W_CC)
+    -l <LIB>                With --compile: also link against LIB (e.g. -l user32)
+        --keep-asm          With --compile: keep the Windows assembly next to the .exe
         --check             Only parse and analyze the input, report diagnostics
         --dump-tokens       Print the lexer token stream
         --dump-ast          Print the parsed AST (debug format)
@@ -67,6 +70,10 @@ pub struct Options {
     pub target: Target,
     pub mode: Mode,
     pub verbose: bool,
+    /// Extra libraries for `--compile` (without `-l`).
+    pub libs: Vec<String>,
+    /// Keep the intermediate assembly (`--compile`).
+    pub keep_asm: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +110,8 @@ where
     let mut target = Target::Windows;
     let mut modes: Vec<(Mode, &'static str)> = Vec::new();
     let mut verbose = false;
+    let mut libs: Vec<String> = Vec::new();
+    let mut keep_asm = false;
 
     while let Some(arg) = args.next() {
         // Support `--flag=value` as well as `--flag value`.
@@ -142,6 +151,9 @@ where
             "--dump-ast" => modes.push((Mode::DumpAst, "--dump-ast")),
             "--dump-ir" => modes.push((Mode::DumpIr, "--dump-ir")),
             "-v" | "--verbose" => verbose = true,
+            "--keep-asm" => keep_asm = true,
+            "-l" => libs.push(value("-l")?),
+            f if f.starts_with("-l") && f.len() > 2 => libs.push(f[2..].to_string()),
             "-" => return err("reading from stdin is not supported; pass a file path"),
             f if f.starts_with('-') => {
                 return err(format!("unknown option `{f}` (see `l2w --help`)"))
@@ -173,6 +185,15 @@ where
     if inspect_only && output.is_some() {
         return err("`-o` cannot be combined with --check or --dump-*");
     }
+    if mode != Mode::Compile && (keep_asm || !libs.is_empty()) {
+        return err("`-l` and `--keep-asm` require --compile");
+    }
+    if let Some(lib) = libs.iter().find(|l| {
+        !l.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+    }) {
+        return err(format!("invalid library name `{lib}`"));
+    }
     let output = match (mode, output) {
         (Mode::Compile, None) => Some(input.with_extension("exe")),
         (_, o) => o,
@@ -183,6 +204,8 @@ where
         target,
         mode,
         verbose,
+        libs,
+        keep_asm,
     }))
 }
 
@@ -219,6 +242,10 @@ mod tests {
         assert_eq!(run(&["in.s", "--check"]).mode, Mode::Check);
         assert!(run(&["in.s", "--verbose"]).verbose);
         assert!(run(&["-v", "in.s"]).verbose);
+
+        let o = run(&["in.s", "--compile", "-l", "user32", "-lgdi32", "--keep-asm"]);
+        assert_eq!(o.libs, ["user32", "gdi32"]);
+        assert!(o.keep_asm);
     }
 
     #[test]
@@ -237,5 +264,7 @@ mod tests {
         assert!(e(&["a.s", "--frobnicate"]).contains("unknown option"));
         assert!(e(&["a.s", "--check", "--compile"]).contains("conflicting options"));
         assert!(e(&["a.s", "--check", "-o", "x"]).contains("cannot be combined"));
+        assert!(e(&["a.s", "-l", "user32"]).contains("require --compile"));
+        assert!(e(&["a.s", "--compile", "-l", "x;rm"]).contains("invalid library name"));
     }
 }
