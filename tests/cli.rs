@@ -304,6 +304,91 @@ fn compile_builds_windows_executables() {
     );
 }
 
+/// LP64 -> LLP64: `long` values must reach the Windows C runtime at full
+/// width (`labs` -> `_abs64`, `%ld` -> `%I64d`, glibc `__isoc23_` aliases).
+const LP64_PROGRAM: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+    volatile int sh = 40;
+    long big = 1L << sh;
+    unsigned long ub = ((unsigned long)0xfedcba98u << (sh - 8)) | 0x76543210u;
+    char buf[128];
+    long parsed = 0;
+    printf("%ld %lu %lx %lX\n", big, ub, ub, big);
+    printf("%5ld|%-14ld|%+ld|%lld|%zu|%%ld|%d\n", -big, big, big, -big, (size_t)big, 42);
+    printf("%s %c %li %lo\n", "str", 'c', -big, big);
+    printf("labs %ld\n", labs(-big));
+    printf("strtol %ld\n", strtol("1099511627776", NULL, 10));
+    printf("strtoul %lu\n", strtoul("18364758544493064720", NULL, 10));
+    printf("atol %ld\n", atol("-1099511627777"));
+    snprintf(buf, sizeof buf, "%ld/%lu", -big, ub);
+    puts(buf);
+    sprintf(buf, "%ld", big * 3);
+    puts(buf);
+    sscanf("1099511627779", "%ld", &parsed);
+    printf("sscanf %ld\n", parsed);
+    printf("%ld %ld %ld %ld %ld %ld %ld\n", big+1, big+2, big+3, big+4, big+5, big+6, big+7);
+    return 0;
+}
+"#;
+
+#[test]
+fn long_values_survive_the_windows_c_runtime() {
+    if !tool_works("x86_64-w64-mingw32-gcc", "-dumpmachine") || !tool_works("gcc", "--version") {
+        eprintln!("skipping: gcc or MinGW-w64 not installed");
+        return;
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lp64");
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("lp64.c");
+    std::fs::write(&c, LP64_PROGRAM).unwrap();
+    let flags = [
+        "-O0",
+        "-fno-builtin",
+        "-fcf-protection=none",
+        "-fno-stack-protector",
+    ];
+    let s = dir.join("lp64.s");
+    let gcc = Command::new("gcc")
+        .args(flags)
+        .args(["-S", "-masm=intel", "-fno-asynchronous-unwind-tables", "-o"])
+        .arg(&s)
+        .arg(&c)
+        .output()
+        .unwrap();
+    assert!(
+        gcc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gcc.stderr)
+    );
+    let native = dir.join("lp64");
+    assert!(Command::new("gcc")
+        .args(flags)
+        .arg("-o")
+        .arg(&native)
+        .arg(&c)
+        .status()
+        .unwrap()
+        .success());
+    let expected = Command::new(&native).output().unwrap();
+    let exe = dir.join("lp64.exe");
+    let o = l2w(&[
+        s.to_str().unwrap(),
+        "--compile",
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    if tool_works("wine", "--version") {
+        let out = Command::new("wine").arg(&exe).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            String::from_utf8_lossy(&expected.stdout)
+        );
+    }
+}
+
 #[test]
 fn compile_reports_toolchain_and_entry_problems() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compile");

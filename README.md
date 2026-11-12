@@ -51,7 +51,7 @@ wine hello.exe                                           # or run it on Windows
 | Operands | registers (8–64 bit, `ah`–`dh`), immediates (range-checked), all memory forms, `offset`, `rip`-relative | invalid scale/index, size mismatches, ambiguous sizes, `ah` with REX, `fs:`/`gs:` (TLS) | – |
 | Addressing | `[sym]` → `[rip + sym]`, `mov r64, offset sym` → `lea`, `@GOTPCREL`/`@PLT` resolved | `[reg + sym]`, `.long sym`, `push offset sym` (32-bit absolute addresses), red zone below `rsp` | – |
 | Sections | `.text .data .bss .rodata(.X) .data.rel.ro` → `.text .data .bss .rdata`, `.comm`/`.lcomm` → `.bss`, notes/debug dropped | `.init_array`, `.fini_array`, `.ctors`, TLS (`.tdata`/`.tbss`), `.eh_frame`, hand-written `.got`/`.plt` | – |
-| Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args; **`long` is 32-bit on Windows (LLP64)**: external C functions with `long` parameters/results (e.g. `printf("%ld")`, `labs`) see only the low 32 bits. Assembly has no types, so this can't be detected. |
+| Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args; **`long` is 32-bit on Windows (LLP64)**: known C runtime functions are bridged (`labs` → `_abs64`, `strtol` → `_strtoi64`, `printf("%ld")` → `%I64d`, see below); unknown external functions with `long` parameters/results see only the low 32 bits. |
 | System calls | `read write open close getpid exit exit_group` via Win32 shims (registers + RFLAGS preserved, `-errno`) | unknown syscall numbers, unsupported calls (`mmap`, `fork`, …), untranslatable static `open` flags | `close(0/1/2)` keeps the handle; no `SIGPIPE`; console `\r\n`; absolute paths are relative to the current drive |
 | Build | `--compile` with MinGW-w64 (`main` → C runtime, `_start` → `-nostdlib -lkernel32`) | missing/non-Windows compiler (exit 2, install hints), linker errors (exit 1, hints) | – |
 | Robustness | – | input that would exhaust resources: expressions nested > 64 levels or with > 1000 operators, equate chains > 100 | – |
@@ -394,10 +394,24 @@ Other red-zone use is an **error**, with a hint.
 - **Indirect calls** (`call rax`): warning. The target is assumed to be a System V function
   of the program.
 - **Data model:** Linux is LP64, Windows is LLP64, so `long` is 64 bits on Linux and 32 bits on
-  Windows. Registers are passed through unchanged, but a Windows C function declared with
-  `long` only uses the low 32 bits (`printf("%ld")` prints `int`s). The assembly contains no
-  type information, so `l2w` can't detect this. Use `long long`/`int64_t`/`%lld` functions
-  for 64-bit values.
+  Windows. Assembly has no types: a C `long` is just a 64-bit register, which the bridges
+  pass at full width. The bits are lost *inside* the Windows C runtime, whose functions were
+  compiled with a 32-bit `long`. `l2w` therefore fixes known functions in their thunk
+  (`src/compatibility/data_model.rs`):
+
+  | Linux | Windows |
+  |---|---|
+  | `labs`, `llabs` / `atol`, `atoll` | `_abs64` / `_atoi64` |
+  | `strtol`, `strtoll` / `strtoul`, `strtoull` | `_strtoi64` / `_strtoui64` |
+  | `wcstol` / `wcstoul` | `_wcstoi64` / `_wcstoui64` |
+  | `ftell`, `ftello` / `fseek`, `fseeko` / `lseek` | `_ftelli64` / `_fseeki64` / `_lseeki64` |
+  | `printf`, `fprintf`, `sprintf`, `snprintf`, `scanf`, `fscanf`, `sscanf` | same function; the thunk copies the format string to a 512-byte stack buffer and rewrites `l`, `ll`, `z`, `j`, `t` before `d i o u x X n` to `I64` (`%ld` → `%I64d`; `%lc`, `%ls`, `%%` unchanged; longer formats are passed unchanged) |
+
+  The glibc aliases `__isoc23_*`/`__isoc99_*` (e.g. `__isoc23_strtol`, which gcc emits with
+  current glibc headers) are mapped to the standard names. Known functions that can't be
+  bridged (`ldiv`, `lldiv`, `gettimeofday`, `v*printf`/`v*scanf` with a System V `va_list`)
+  get a warning. Other external functions with `long` parameters or results still only see
+  the low 32 bits: their signatures aren't visible in the assembly.
 - Not handled: passing the address of a translated function to Windows code as a callback
   (e.g. for `qsort`), structs passed by value, functions with more than 10 arguments, and
   128-bit return values (rdx:rax).

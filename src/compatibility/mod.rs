@@ -2,5 +2,6 @@
 //! directive/section mapping (Phases 3-5).
 
 pub mod calling_convention;
+pub mod data_model;
 pub mod directives;
 pub mod syscalls;

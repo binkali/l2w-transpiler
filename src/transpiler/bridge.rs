@@ -19,6 +19,7 @@
 use super::Transpiler;
 use crate::ast::{Expr, RegKind, Register, Size};
 use crate::compatibility::calling_convention as cc;
+use crate::compatibility::data_model as dm;
 use crate::compatibility::directives::{map_section, SectionMapping};
 use crate::diagnostics::{Diagnostic, Span};
 use crate::ir::*;
@@ -129,11 +130,37 @@ impl Transpiler {
                 .push(format!("bridge: {what} `{f}` for System V body `{body}`"));
             snippets.push((f, src, true));
         }
-        for e in externals {
+        for (e, span) in externals {
             self.notes.push(format!(
                 "bridge: System V -> Windows thunk for external `{e}`"
             ));
-            snippets.push((cc::thunk_name(&e), cc::sysv_to_win_thunk(&e), false));
+            let std = dm::canonical_name(&e);
+            let src = if let Some(win) = dm::replacement(std) {
+                self.notes
+                    .push(format!("data model: `{e}` -> `{win}` (64-bit `long`)"));
+                cc::sysv_to_win_thunk_to(&e, win)
+            } else if let Some(k) = dm::format_argument(std) {
+                self.notes.push(format!(
+                    "data model: `{e}` -> `{std}` with the format string rewritten at run time (`%ld` -> `%I64d`)"
+                ));
+                dm::format_thunk(&e, std, k)
+            } else {
+                if let Some(why) = dm::unbridged(std) {
+                    self.diags.push(
+                        Diagnostic::warning(
+                            format!("`{e}` does not work correctly on Windows: {why}"),
+                            span,
+                        )
+                        .with_help("Windows uses the LLP64 data model (32-bit `long`); avoid this function or pass 64-bit values another way"),
+                    );
+                }
+                if std != e {
+                    self.notes
+                        .push(format!("bridge: glibc alias `{e}` -> `{std}`"));
+                }
+                cc::sysv_to_win_thunk_to(&e, std)
+            };
+            snippets.push((cc::thunk_name(&e), src, false));
         }
         if !snippets.is_empty() {
             self.append_code(snippets);
@@ -310,9 +337,9 @@ impl Transpiler {
     }
 
     /// Redirects `call ext` / `jmp ext` / `jcc ext` to thunks and returns
-    /// the external functions in order of first use.
-    fn redirect_external_branches(&mut self) -> Vec<String> {
-        let mut externals: Vec<String> = Vec::new();
+    /// the external functions in order of first use, with the first use.
+    fn redirect_external_branches(&mut self) -> Vec<(String, Span)> {
+        let mut externals: Vec<(String, Span)> = Vec::new();
         for s in 0..self.module.sections.len() {
             if !self.is_kept(s) {
                 continue;
@@ -345,11 +372,12 @@ impl Transpiler {
                         continue;
                     }
                 };
+                let span = ins.operand_spans.first().copied().unwrap_or(ins.span);
                 if let Item::Instr(ins) = &mut self.module.sections[s].items[i] {
                     ins.operands[0] = Operand::Target(Expr::symbol(cc::thunk_name(&name)));
                 }
-                if !externals.contains(&name) {
-                    externals.push(name);
+                if !externals.iter().any(|(e, _)| *e == name) {
+                    externals.push((name, span));
                 }
             }
         }
@@ -629,6 +657,45 @@ mod tests {
             first_error("main:\n lea rdi, [rip + puts]\n ret\n").contains("external symbol `puts`")
         );
         assert!(first_error(".data\np: .quad malloc\n").contains("external symbol `malloc`"));
+    }
+
+    #[test]
+    fn long_functions_use_64_bit_replacements() {
+        let out = asm(".globl main\nmain:\n sub rsp, 8\n call labs\n call __isoc23_strtol\n call ftell\n add rsp, 8\n ret\n");
+        assert!(out.contains("    call __l2w_thunk_labs\n"), "{out}");
+        assert!(out.contains("__l2w_thunk_labs:\n"), "{out}");
+        assert!(out.contains("    call _abs64\n"), "{out}");
+        assert!(out.contains("    call _strtoi64\n"), "{out}");
+        assert!(out.contains("    call _ftelli64\n"), "{out}");
+        assert!(!out.contains("call labs\n"), "{out}");
+    }
+
+    #[test]
+    fn format_functions_rewrite_the_format() {
+        let out = asm(".globl main\nmain:\n sub rsp, 8\n call printf\n call __isoc99_sscanf\n add rsp, 8\n ret\n");
+        assert!(out.contains("__l2w_thunk_printf:\n"), "{out}");
+        assert!(out.contains("    mov rax, rdi\n"), "{out}");
+        assert!(out.contains("    lea rdi, [rsp + 80]\n"), "{out}");
+        assert!(out.contains("    call printf\n"), "{out}");
+        assert!(out.contains("    lea rsi, [rsp + 80]\n"), "{out}");
+        assert!(out.contains("    call sscanf\n"), "{out}");
+    }
+
+    #[test]
+    fn unbridged_long_functions_warn() {
+        let t = translate("main:\n call ldiv\n call __isoc23_vsscanf\n call puts\n ret\n");
+        assert!(!t.has_errors());
+        let w: Vec<_> = t.diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            w.iter()
+                .any(|m| m.starts_with("`ldiv` does not work correctly on Windows")),
+            "{w:?}"
+        );
+        assert!(
+            w.iter().any(|m| m.starts_with("`__isoc23_vsscanf`")),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|m| m.contains("puts")), "{w:?}");
     }
 
     #[test]
