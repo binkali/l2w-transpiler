@@ -65,6 +65,13 @@ pub fn sysv_body_name(f: &str) -> String {
 /// at `[rsp + 8]`..`[rsp + 32]`, i.e. `[rbp + 16]`.. after `push rbp`.
 /// The Windows call frame is 32 bytes shadow space + arguments 5..10.
 pub fn sysv_to_win_thunk(target: &str) -> String {
+    sysv_to_win_thunk_to(target, target)
+}
+
+/// Thunk for external `f` (named [`thunk_name`]`(f)`) that calls the
+/// Windows function `target`, e.g. a 64-bit replacement
+/// (see [`super::data_model`]).
+pub fn sysv_to_win_thunk_to(f: &str, target: &str) -> String {
     let stack_args = FORWARDED_ARGS - WIN64_ARGS.len() as u32; // 6: args 5..10
     let frame = SHADOW_SPACE + 8 * stack_args; // 80, multiple of 16
     let mut s = format!(
@@ -75,7 +82,7 @@ pub fn sysv_to_win_thunk(target: &str) -> String {
          \x20   and rsp, -16\n\
          \x20   mov qword ptr [rsp + 32], r8\n\
          \x20   mov qword ptr [rsp + 40], r9\n",
-        name = symbol_name(&thunk_name(target))
+        name = symbol_name(&thunk_name(f))
     );
     let target = symbol_name(target);
     // System V arguments 7..10 -> Windows stack slots 7..10.
