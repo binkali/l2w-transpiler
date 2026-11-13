@@ -1,6 +1,6 @@
 [package]
 name = "l2w"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Linux-to-Windows x86-64 assembly transpiler (GAS Intel syntax, System V -> Windows x64)"
