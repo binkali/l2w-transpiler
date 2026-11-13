@@ -327,9 +327,17 @@ mod tests {
             "f:\nmov rax, 1\nlbl:\nsyscall\n\
              g:\nmov rax, 2\ncall f\nsyscall\n\
              h:\nmov eax, -1\nmov rbx, rax\nmov rdi, rbx\nadd rdi, 4\nmov al, 3\nsyscall\n\
-             k:\nmov rax, 60\ncmp rdi, 0\njne k\nmov dil, 1\nsyscall\nret\n",
+             k:\nmov rax, 60\ncmp rdi, 0\njne k\nmov dil, 1\nsyscall\nret\n\
+             c:\nmov eax, 60\nmov edi, 7\nmov esi, 8\ncmp rbx, 1\ncmovl eax, ebx\nsete dil\nsetne byte ptr [rsi]\nsyscall\nret\n",
         );
         let s = &m.platform.syscalls;
+        assert_eq!(s[4].number, Value::Unknown, "cmovcc may write eax");
+        assert_eq!(s[4].args[0], Value::Unknown, "setcc writes dil");
+        assert_eq!(
+            s[4].args[1],
+            Value::Const(8),
+            "setcc to memory writes no register"
+        );
         assert_eq!(s[0].number, Value::Unknown, "label between");
         assert_eq!(s[1].number, Value::Unknown, "call clobbers");
         assert_eq!(s[2].number, Value::Unknown, "partial write");

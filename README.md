@@ -47,12 +47,12 @@ wine hello.exe                                           # or run it on Windows
 | Area | Supported (translated, semantics preserved) | Rejected with a diagnostic | Documented differences |
 |---|---|---|---|
 | Syntax | GAS Intel syntax (`noprefix`), labels, numeric labels `1:`/`1b`/`1f`, equates, expressions, comments | AT&T syntax, `.intel_syntax prefix`, macros, `.if`, `.include`, floating-point literals | – |
-| Instructions | `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall`, `lock` prefix | everything else (SSE/AVX, `setcc`, `cmovcc`, string instructions, `movabs`, …) with the list of supported ones | – |
+| Instructions | `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo set<cc> cmov<cc> jmp j<cc> call ret push pop pushfq popfq leave nop syscall`, `lock` prefix | everything else (SSE/AVX, string instructions, `movabs`, …) with the list of supported ones | – |
 | Operands | registers (8–64 bit, `ah`–`dh`), immediates (range-checked), all memory forms, `offset`, `rip`-relative | invalid scale/index, size mismatches, ambiguous sizes, `ah` with REX, `fs:`/`gs:` (TLS) | – |
 | Addressing | `[sym]` → `[rip + sym]`, `mov r64, offset sym` → `lea`, `@GOTPCREL`/`@PLT` resolved | `[reg + sym]`, `.long sym`, `push offset sym` (32-bit absolute addresses), red zone below `rsp` | – |
 | Sections | `.text .data .bss .rodata(.X) .data.rel.ro` → `.text .data .bss .rdata`, `.comm`/`.lcomm` → `.bss`, notes/debug dropped | `.init_array`, `.fini_array`, `.ctors`, TLS (`.tdata`/`.tbss`), `.eh_frame`, hand-written `.got`/`.plt` | – |
 | Calls | System V internally; thunks for external calls (≤ 10 integer args, shadow space, alignment); Windows wrappers for exported functions and `main`; `_start` entry wrapper; gcc `-O0` red zone in leaf functions | external symbols as data or address, reading argc/argv in `_start` | indirect calls assume System V targets (warning); no callbacks into Windows code, no struct-by-value or > 10 args; **`long` is 32-bit on Windows (LLP64)**: external C functions with `long` parameters/results (e.g. `printf("%ld")`, `labs`) see only the low 32 bits. Assembly has no types, so this can't be detected. |
-| System calls | `read write open close getpid exit exit_group` via Win32 shims (registers + RFLAGS preserved, `-errno`) | unknown syscall numbers, unsupported calls (`mmap`, `fork`, …), untranslatable static `open` flags | `close(0/1/2)` keeps the handle; no `SIGPIPE`; console `\r\n`; absolute paths are relative to the current drive |
+| System calls | `read write open close lseek getpid exit exit_group` via Win32 shims (registers + RFLAGS preserved, `-errno`) | unknown syscall numbers, unsupported calls (`mmap`, `fork`, …), untranslatable static `open` flags | `close(0/1/2)` keeps the handle; no `SIGPIPE`; console `\r\n`; absolute paths are relative to the current drive |
 | Build | `--compile` with MinGW-w64 (`main` → C runtime, `_start` → `-nostdlib -lkernel32`) | missing/non-Windows compiler (exit 2, install hints), linker errors (exit 1, hints) | – |
 | Robustness | – | input that would exhaust resources: expressions nested > 64 levels or with > 1000 operators, equate chains > 100 | – |
 
@@ -133,7 +133,7 @@ tests/
 ├── cli.rs                   end-to-end tests of the binary
 ├── roundtrip.rs             AST/IR → listing → `as` object comparison
 └── windows.rs               MinGW assembly + behavioral equivalence
-examples/                    sample programs (library, hello, loop, functions, errors, errors_semantic)
+examples/                    sample programs (library, hello, hello_world, loop, functions, errors, errors_semantic)
 ```
 
 ## Supported input (phase 1)
@@ -236,13 +236,15 @@ encoding for both forms.
 
 ### Validation
 
-- **Instructions:** `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop leave nop syscall`.
-  All `jcc` aliases are accepted and normalized (`jz` → `je`, `jnle` → `jg`, …). Anything
-  else is an error (`unsupported instruction`), with line, column and the list of supported
-  instructions.
+- **Instructions:** `mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo set<cc> cmov<cc> jmp j<cc> call ret push pop pushfq popfq leave nop syscall`.
+  All condition-code aliases are accepted and normalized (`jz` → `je`, `setnz` → `setne`,
+  `cmovnle` → `cmovg`, …). Anything else is an error (`unsupported instruction`), with line,
+  column and the list of supported instructions.
 - **Operand forms**, per instruction: arity; register/memory/immediate allowed or not; no
   memory-to-memory operands; `lea` needs memory; `jcc` needs a label; shift count must be an
-  immediate or `cl`; `movzx`/`movsx` source sizes; `push`/`pop` only 64/16-bit.
+  immediate or `cl`; `movzx`/`movsx` source sizes; `push`/`pop` only 64/16-bit; `setcc` takes
+  an 8-bit register or memory operand (a memory operand defaults to `byte ptr`, as in GAS);
+  `cmovcc` needs a 16/32/64-bit register destination and a source of the same size.
 - **Operand sizes:** inferred from registers (`mov [rbx], ecx` → `dword ptr`); conflicts
   (`mov rax, ebx`) and ambiguous sizes (`inc [rdi]`, `mov [rax], 1`) are errors.
   `push`/`pop`/`jmp`/`call [mem]` default to `qword`, `movsxd` to `dword`, just like GAS.
@@ -267,9 +269,9 @@ encoding for both forms.
 - **Register values at `syscall`:** a conservative backward scan within the basic block. It
   understands `mov` (immediate, `offset`, copying from a register, 32-bit zero-extension),
   `xor/sub reg, reg`, `lea [rip + sym]`, and `add/sub/inc/dec` with constants. It stops at
-  labels, `call`, `jmp`/`ret` and partial (8/16-bit) writes. Across a `syscall`, only `rax`,
-  `rcx` and `r11` are treated as clobbered; on the fall-through path of a `jcc`, earlier
-  values stay valid.
+  labels, `call`, `jmp`/`ret` and partial (8/16-bit) writes, including `setcc`; a `cmovcc`
+  makes its destination unknown. Across a `syscall`, only `rax`, `rcx` and `r11` are treated
+  as clobbered; on the fall-through path of a `jcc`, earlier values stay valid.
 
 ```text
 $ l2w examples/hello.s --dump-ir
@@ -433,6 +435,7 @@ Windows has no stable system-call interface. `l2w` replaces every `syscall` with
 | `write(fd, buf, count)` | 1 | `WriteFile` (+ `SetFilePointerEx` for `O_APPEND`) |
 | `open(path, flags, mode)` | 2 | `CreateFileA` |
 | `close(fd)` | 3 | `CloseHandle` |
+| `lseek(fd, offset, whence)` | 8 | `SetFilePointerEx` (`SEEK_SET/CUR/END` = `FILE_BEGIN/CURRENT/END`; other `whence` values → `-EINVAL`) |
 | `getpid()` | 39 | `GetCurrentProcessId` |
 | `exit(status)`, `exit_group(status)` | 60, 231 | `ExitProcess(status & 0xff)` |
 
@@ -473,9 +476,10 @@ flags are checked at run time (`-EINVAL`).
 - Win32 errors (`GetLastError`) → `-errno`: `ERROR_FILE_NOT_FOUND`/`PATH_NOT_FOUND` →
   `ENOENT`, `ACCESS_DENIED` → `EACCES`, `INVALID_HANDLE` → `EBADF`,
   `FILE_EXISTS`/`ALREADY_EXISTS` → `EEXIST`, `TOO_MANY_OPEN_FILES` → `EMFILE`,
-  `INVALID_PARAMETER`/`INVALID_NAME` → `EINVAL`, `BROKEN_PIPE`/`NO_DATA` → `EPIPE`,
-  `DISK_FULL` → `ENOSPC`, `FILENAME_EXCED_RANGE` → `ENAMETOOLONG`, `NOACCESS` → `EFAULT`,
-  everything else → `EIO`. A broken pipe on `read` is end of file (0).
+  `INVALID_PARAMETER`/`INVALID_NAME`/`NEGATIVE_SEEK` → `EINVAL`, `INVALID_FUNCTION` →
+  `ESPIPE` (seeking a pipe or console), `BROKEN_PIPE`/`NO_DATA` → `EPIPE`, `DISK_FULL` →
+  `ENOSPC`, `FILENAME_EXCED_RANGE` → `ENAMETOOLONG`, `NOACCESS` → `EFAULT`, everything else
+  → `EIO`. A broken pipe on `read` is end of file (0).
 - `read`/`write` transfer at most `0x7ffff000` bytes per call, like Linux.
 
 ### Remaining differences (by design, documented)
@@ -484,6 +488,9 @@ flags are checked at run time (`-EINVAL`).
   **same** console handle on Windows).
 - `write` to a broken pipe returns `-EPIPE`, but there is no `SIGPIPE` that would terminate
   the process.
+- `lseek` on a pipe returns `-ESPIPE` like Linux; on a console handle the errno depends on
+  the Win32 error code Windows reports (`ERROR_INVALID_FUNCTION` → `-ESPIPE`, other codes as
+  mapped above).
 - The console delivers `\r\n` line endings on `read`. Paths are passed to `CreateFileA` as
   they are: `/` works as a separator, but absolute Linux paths like `/tmp/x` refer to the
   root of the current drive.
@@ -499,7 +506,9 @@ writes its arguments into the caller's **shadow space** (gcc `-O0`). `examples/h
 `loop.s`, `functions.s`, and a file-I/O test program must produce the **same stdout and the
 same exit status** as the original Linux binary. The file-I/O program covers lowest-free fd,
 `O_TRUNC`, `O_APPEND`, `O_EXCL` → `EEXIST`, `ENOENT`, `EBADF` for wrong access mode or a
-closed fd, register and flag preservation across `syscall`, and `exit(318)` → status 62.
+closed fd, `lseek` with all three `whence` values plus `-EINVAL` (negative position, bad
+`whence`), `-ESPIPE` (stdout pipe) and `-EBADF`, register and flag preservation across
+`syscall`, and `exit(384)` → status 128.
 Deliberately broken shims (no `pushfq`/`popfq`, no call frame) are caught by the test.
 The examples also link with MinGW into PE executables that import only `KERNEL32.dll`.
 
@@ -512,7 +521,7 @@ See also the [feature matrix](#feature-matrix).
 - Subsections, `.weak`, `.pushsection`/`.popsection`
 - Floating-point literals
 - `ymm`/`zmm`, mask and control registers
-- SSE/AVX, string instructions (`movs`, `stos`, `rep`), `setcc`/`cmovcc`, `movabs`,
+- SSE/AVX, string instructions (`movs`, `stos`, `rep`), `movabs`,
   `.set` redefinition, and `.lcomm` with an alignment argument (GAS/ELF doesn't accept it)
 
 ## Tests
@@ -524,8 +533,16 @@ L2W_FUZZ_ITERATIONS=60000 cargo test --release --test robustness   # longer fuzz
 L2W_BLESS=1 cargo test --test spec golden   # regenerate the expected diagnostics
 ```
 
-Tests that need external tools (GNU `as`, `gcc`, MinGW-w64, Wine) skip themselves
-with a message if the tool is missing.
+Tests that need external tools skip themselves with a message if the tool is missing, and
+they check that the tool is the *right* one (on macOS, `as`/`gcc` are LLVM tools that don't
+understand GAS syntax):
+
+| Tests | Requirement | Found as |
+|---|---|---|
+| `roundtrip` | GNU `as`/`objdump` for x86-64 ELF | `as`, `x86_64-linux-gnu-as`, `x86_64-elf-as` (macOS: `brew install x86_64-elf-binutils`) |
+| behavioral (`windows`, `spec`) | an **x86-64 Linux host** with `gcc` (the original Linux program is executed) | `gcc`, `x86_64-linux-gnu-gcc` |
+| `--compile`, MinGW object checks | MinGW-w64 | `x86_64-w64-mingw32-gcc` (macOS: `brew install mingw-w64`) |
+| running `.exe` files | Wine | `wine` |
 
 **With Wine installed**, every behavioral test also builds the translation as a real `.exe`
 (MinGW-w64, `-nostdlib -lkernel32`) and runs it under Wine, i.e. against the real
@@ -553,7 +570,7 @@ available, the translation as a **real Windows `.exe` under Wine**. All of them 
 | # | Requirement | Test | Covers |
 |---|---|---|---|
 | 1 | arithmetic with `mov`, `add`, `sub` | `spec_01_arithmetic` | also `imul idiv div and or xor not neg inc dec sar shr shl lea xchg`, 32-bit zero extension, 8-bit writes, overflow |
-| 2 | conditions with `cmp` and `je` | `spec_02_conditions` | 20 `jcc` aliases (`je/jz … ja/jnbe, jb, js`) against a reference model, signed and unsigned edge values, `test` |
+| 2 | conditions with `cmp` and `je` | `spec_02_conditions` | 20 `jcc` aliases (`je/jz … ja/jnbe, jb, js`) against a reference model, signed and unsigned edge values, `test`; the same masks computed branch-free with `setcc`/`cmovcc` |
 | 3 | loops with labels and `jmp` | `spec_03_loops` | top-tested, nested, `dec/jnz`, numeric labels `1b`/`1f` |
 | 4 | string output with `write` | `spec_04_write` | return values, partial and zero-length writes, invalid fd → `-EBADF` |
 | 5 | program exit with `exit` | `spec_05_exit` | `exit`/`exit_group`, status 0…300 and −1 (truncated to 8 bits) |
@@ -606,7 +623,7 @@ given via `L2W_CC`, an undefined symbol, and a missing entry point.
 
 ## Possible extensions
 
-More instructions (`setcc`, `cmovcc`, string instructions, SSE with `xmm6–15` saving in
-the wrappers), more system calls (`lseek` → `SetFilePointerEx`, `fstat`, `mmap` →
-`VirtualAlloc`, `brk`), callbacks (Windows → System V thunks for function pointers that
-are passed to Windows code), and `.weak`/macros in the front end.
+More instructions (string instructions, `movabs`, SSE with `xmm6–15` saving in the
+wrappers), more system calls (`fstat`, `mmap` → `VirtualAlloc`, `brk`), callbacks
+(Windows → System V thunks for function pointers that are passed to Windows code), and
+`.weak`/macros in the front end.

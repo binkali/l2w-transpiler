@@ -228,6 +228,27 @@ fn conditions_function() -> String {
     s + "    test rdi, rsi\n    jne .Lct_done\n    or eax, 0x80000000\n.Lct_done:\n    ret\n"
 }
 
+/// `conds_bl(a, b)`: the same mask as `conds`, computed without branches:
+/// `set<cc>` for even indices, `cmov<cc>` for odd ones, bit 31 via `cmovne`.
+fn conditions_function_branchless() -> String {
+    let mut s = String::from("conds_bl:\n    xor eax, eax\n");
+    for (i, c) in CONDITIONS.iter().enumerate() {
+        if i % 2 == 0 {
+            let _ = write!(
+                s,
+                "    cmp rdi, rsi\n    set{c} cl\n    movzx ecx, cl\n    shl ecx, {i}\n    or eax, ecx\n"
+            );
+        } else {
+            let _ = write!(
+                s,
+                "    xor ecx, ecx\n    mov edx, {}\n    cmp rdi, rsi\n    cmov{c} ecx, edx\n    or eax, ecx\n",
+                1u32 << i
+            );
+        }
+    }
+    s + "    mov ecx, 0x80000000\n    xor edx, edx\n    test rdi, rsi\n    cmovne ecx, edx\n    or eax, ecx\n    ret\n"
+}
+
 /// Reference: which conditions hold for (a, b).
 fn expected_mask(a: i64, b: i64) -> u32 {
     let (ua, ub) = (a as u64, b as u64);
@@ -276,18 +297,18 @@ fn spec_02_conditions() {
     ];
     let mut body = String::new();
     for (a, b) in pairs {
-        let _ = write!(body, "    mov rdi, {a}\n    mov rsi, {b}\n    call conds\n    mov rdi, rax\n    call print_num\n");
+        for f in ["conds", "conds_bl"] {
+            let _ = write!(body, "    mov rdi, {a}\n    mov rsi, {b}\n    call {f}\n    mov rdi, rax\n    call print_num\n");
+        }
     }
-    let Some((out, _)) = same_behavior(
-        "conditions",
-        &program(&body, &conditions_function(), ""),
-        "",
-    ) else {
+    let functions = conditions_function() + &conditions_function_branchless();
+    let Some((out, _)) = same_behavior("conditions", &program(&body, &functions, ""), "") else {
         return;
     };
+    // Every mask twice: once from `jcc`, once from `setcc`/`cmovcc`.
     let expected: Vec<String> = pairs
         .iter()
-        .map(|(a, b)| expected_mask(*a, *b).to_string())
+        .flat_map(|(a, b)| std::iter::repeat(expected_mask(*a, *b).to_string()).take(2))
         .collect();
     assert_eq!(lines(&out), expected);
 }
@@ -876,8 +897,8 @@ fn spec_10_cross_compilation() {
         (
             "conditions",
             program(
-                "    mov edi, 1\n    mov esi, 2\n    call conds\n",
-                &conditions_function(),
+                "    mov edi, 1\n    mov esi, 2\n    call conds\n    call conds_bl\n",
+                &(conditions_function() + &conditions_function_branchless()),
                 "",
             ),
         ),

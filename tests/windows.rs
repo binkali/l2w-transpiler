@@ -267,16 +267,16 @@ int main(void) {
 
 #[test]
 fn translated_code_behaves_like_the_original() {
-    if !available("gcc") {
-        eprintln!("skipping: gcc not available");
+    let Some(gcc) = linux_gcc() else {
+        eprintln!("skipping: {LINUX_HOST_HINT}");
         return;
-    }
+    };
     let d = dir();
     let harness = d.join("harness.c");
     std::fs::write(&harness, HARNESS).unwrap();
     let build_and_run = |tag: &str, translated: bool, sources: &[(&str, String)]| -> String {
         let exe = d.join(format!("{tag}-test"));
-        let mut cmd = Command::new("gcc");
+        let mut cmd = Command::new(&gcc);
         // -no-pie: the original Linux code uses 32-bit absolute addresses.
         cmd.args(["-no-pie", "-o"]).arg(&exe).arg(&harness);
         if translated {
@@ -360,7 +360,7 @@ first:   .ascii "abc\n"
 second:  .ascii "def\n"
 .bss
 buf:     .zero 64
-res:     .zero 16
+res:     .zero 24
 .text
 .globl _start
 _start:
@@ -431,6 +431,59 @@ _start:
     mov edi, 1
     lea rsi, [rip + buf]
     syscall
+    mov eax, 8                  # lseek(fd, 4, SEEK_SET) -> 4
+    mov rdi, rbx
+    mov esi, 4
+    xor edx, edx
+    syscall
+    mov r8, rax
+    mov eax, 8                  # lseek(fd, -2, SEEK_END) -> 6
+    mov rdi, rbx
+    mov rsi, -2
+    mov edx, 2
+    syscall
+    add r8, rax
+    mov eax, 8                  # lseek(fd, 0, SEEK_CUR) -> 6
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, 1
+    syscall
+    add r8, rax
+    mov eax, 8                  # lseek(fd, -100, SEEK_SET) -> -EINVAL
+    mov rdi, rbx
+    mov rsi, -100
+    xor edx, edx
+    syscall
+    add r8, rax
+    mov eax, 8                  # lseek(fd, 0, 7) -> -EINVAL (bad whence)
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, 7
+    syscall
+    add r8, rax
+    mov eax, 8                  # lseek(1, 0, SEEK_CUR): stdout is a pipe -> -ESPIPE
+    mov edi, 1
+    xor esi, esi
+    mov edx, 1
+    syscall
+    add r8, rax
+    mov eax, 8                  # lseek(200, 0, SEEK_SET) -> -EBADF
+    mov edi, 200
+    xor esi, esi
+    xor edx, edx
+    syscall
+    add r8, rax
+    mov qword ptr [rip + res + 16], r8   # 4 + 6 + 6 - 22 - 22 - 29 - 9 = -66
+    xor eax, eax                # read from position 6: "f\n"
+    mov rdi, rbx
+    lea rsi, [rip + buf]
+    mov edx, 64
+    syscall
+    mov rdx, rax                # 2
+    mov eax, 1
+    mov edi, 1
+    lea rsi, [rip + buf]
+    syscall
     mov eax, 1                  # write to a read-only fd -> -EBADF
     mov rdi, rbx
     lea rsi, [rip + buf]
@@ -472,13 +525,14 @@ _start:
     syscall
     test rax, rax
     jne fail
-    # status = 256 + 3 + 4 + 9 + 27 + 17 + 2 = 318; Linux reports 318 & 0xff = 62
+    # status = 256 + 3 + 4 + 9 + 27 + 17 + 2 + 66 = 384; Linux reports 384 & 0xff = 128
     lea rdi, [r12 + 256]
     add rdi, r13
     sub rdi, r14
     sub rdi, r15
     sub rdi, qword ptr [rip + res]
     sub rdi, qword ptr [rip + res + 8]
+    sub rdi, qword ptr [rip + res + 16]
     mov eax, 60
     syscall
 fail:
@@ -490,10 +544,10 @@ fail:
 
 #[test]
 fn translated_syscalls_behave_like_linux() {
-    if !available("gcc") {
-        eprintln!("skipping: gcc not available");
+    let Some(gcc) = linux_gcc() else {
+        eprintln!("skipping: {LINUX_HOST_HINT}");
         return;
-    }
+    };
     let d = dir().join("syscalls");
     std::fs::create_dir_all(&d).unwrap();
     let mock = d.join("win32_mock.c");
@@ -508,7 +562,7 @@ fn translated_syscalls_behave_like_linux() {
         let orig_s = d.join(format!("{name}.s"));
         std::fs::write(&orig_s, src).unwrap();
         let orig = d.join(format!("{name}-linux"));
-        run(Command::new("gcc")
+        run(Command::new(&gcc)
             .args(["-nostdlib", "-static", "-no-pie", "-o"])
             .arg(&orig)
             .arg(&orig_s));
@@ -520,7 +574,7 @@ fn translated_syscalls_behave_like_linux() {
         )
         .unwrap();
         let tr = d.join(format!("{name}-win"));
-        run(Command::new("gcc")
+        run(Command::new(&gcc)
             .args(["-no-pie", "-O0", "-fno-omit-frame-pointer", "-o"])
             .arg(&tr)
             .arg(&mock)
@@ -533,7 +587,7 @@ fn translated_syscalls_behave_like_linux() {
             assert_eq!(expected, wine, "{name}: under Wine");
         }
         if name == "syscalls" {
-            assert_eq!(expected, ("abc\ndef\n".to_string(), 62));
+            assert_eq!(expected, ("abc\ndef\ndef\nf\n".to_string(), 128));
         }
         if name == "hello" {
             assert_eq!(expected.0, "Hello, World!\n");
