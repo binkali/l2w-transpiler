@@ -1,5 +1,7 @@
 //! End-to-end tests of the `l2w` binary.
 
+mod common;
+use common::linux_target_gcc;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -34,6 +36,7 @@ fn check_accepts_examples() {
 fn syscalls_are_translated_or_reported() {
     for ex in [
         "examples/hello.s",
+        "examples/hello_world.s",
         "examples/loop.s",
         "examples/functions.s",
     ] {
@@ -243,12 +246,13 @@ fn compile_builds_windows_executables() {
     assert!(asm.contains("call __l2w_sys_write"), "{asm}");
 
     // A `main` program using the C runtime (gcc -O0 output with printf).
-    if tool_works("gcc", "--version") {
+    // Needs a gcc that emits x86-64 Linux assembly (not Apple clang).
+    if let Some(gcc) = linux_target_gcc() {
         let c = dir.join("prog.c");
         std::fs::write(&c, "#include <stdio.h>\nstatic long t[4];\nint add(int a, int b) { int c = a + b; return c; }\n\
                             int main(void) { for (int i = 0; i < 4; i++) t[i] = add(i, i); printf(\"%ld\\n\", t[3]); return 0; }\n").unwrap();
         let s = dir.join("prog.s");
-        let gcc = Command::new("gcc")
+        let gcc = Command::new(&gcc)
             .args([
                 "-O0",
                 "-S",
