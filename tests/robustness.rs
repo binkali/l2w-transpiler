@@ -12,6 +12,7 @@ use std::panic;
 
 const EXAMPLES: &[(&str, &str)] = &[
     ("hello", include_str!("../examples/hello.s")),
+    ("hello_world", include_str!("../examples/hello_world.s")),
     ("loop", include_str!("../examples/loop.s")),
     ("functions", include_str!("../examples/functions.s")),
     ("library", include_str!("../examples/library.s")),
