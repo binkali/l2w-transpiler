@@ -202,6 +202,15 @@ mod tests {
         );
         let ok = errors("f:\n mov eax, 2\n mov esi, 0x241\n mov edx, 0x1a4\n syscall\n ret\n");
         assert!(ok.is_empty(), "{ok:?}");
+        let t =
+            translate("f:\n mov eax, 8\n mov edi, 3\n xor esi, esi\n mov edx, 2\n syscall\n ret\n");
+        assert!(!t.has_errors(), "{:#?}", t.diagnostics);
+        let out = crate::codegen::windows::emit(&t, "t.s");
+        assert!(out.contains("    call __l2w_sys_lseek\n"), "{out}");
+        assert!(
+            out.contains("__l2w_sys_lseek:\n") && out.contains("__l2w_fd_lookup:\n"),
+            "{out}"
+        );
         let e = errors(".globl WriteFile\nWriteFile: ret\nf:\n mov eax, 1\n syscall\n ret\n");
         assert!(e.iter().any(|m| m.contains("defines `WriteFile`")), "{e:?}");
     }

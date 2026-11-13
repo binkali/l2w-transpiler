@@ -10,6 +10,7 @@
 //! | `write(fd, buf, count)` | 1 | `WriteFile` (+ `SetFilePointerEx` for `O_APPEND`) |
 //! | `open(path, flags, mode)` | 2 | `CreateFileA` |
 //! | `close(fd)` | 3 | `CloseHandle` |
+//! | `lseek(fd, offset, whence)` | 8 | `SetFilePointerEx` |
 //! | `getpid()` | 39 | `GetCurrentProcessId` |
 //! | `exit(status)` / `exit_group(status)` | 60 / 231 | `ExitProcess(status & 0xff)` |
 //!
@@ -40,7 +41,8 @@
 //!
 //! Win32 failures are converted from `GetLastError()` to `-errno` via
 //! [`ERRNO_MAP`]; unmapped codes become `-EIO`. A broken pipe makes `read`
-//! return 0 (end of file) and `write` return `-EPIPE`.
+//! return 0 (end of file) and `write` return `-EPIPE`. Seeking on a pipe or
+//! console fails with `ERROR_INVALID_FUNCTION`, which becomes `-ESPIPE`.
 
 /// Name of a Linux x86-64 system call number (for diagnostics and reports).
 pub fn linux_syscall_name(number: i64) -> Option<&'static str> {
@@ -84,6 +86,7 @@ pub fn shim_for(number: i64) -> Option<Shim> {
         1 => ("write", "WriteFile"),
         2 => ("open", "CreateFileA"),
         3 => ("close", "CloseHandle"),
+        8 => ("lseek", "SetFilePointerEx"),
         39 => ("getpid", "GetCurrentProcessId"),
         60 | 231 => ("exit", "ExitProcess"),
         _ => return None,
@@ -93,7 +96,7 @@ pub fn shim_for(number: i64) -> Option<Shim> {
 
 /// Supported system calls, for help messages.
 pub const SUPPORTED: &str =
-    "read (0), write (1), open (2), close (3), getpid (39), exit (60), exit_group (231)";
+    "read (0), write (1), open (2), close (3), lseek (8), getpid (39), exit (60), exit_group (231)";
 
 /// Symbol name of a shim.
 pub fn shim_name(key: &str) -> String {
@@ -133,6 +136,12 @@ pub const ERRNO_MAP: &[(u32, u32, &str)] = &[
     (183, 17, "ERROR_ALREADY_EXISTS -> EEXIST"),
     (87, 22, "ERROR_INVALID_PARAMETER -> EINVAL"),
     (123, 22, "ERROR_INVALID_NAME -> EINVAL"),
+    (131, 22, "ERROR_NEGATIVE_SEEK -> EINVAL"),
+    (
+        1,
+        29,
+        "ERROR_INVALID_FUNCTION -> ESPIPE (seek on a pipe or console)",
+    ),
     (109, 32, "ERROR_BROKEN_PIPE -> EPIPE"),
     (232, 32, "ERROR_NO_DATA -> EPIPE"),
     (112, 28, "ERROR_DISK_FULL -> ENOSPC"),
@@ -398,6 +407,43 @@ fn close() -> String {
     s + &epilogue(".Ll2w_close_done")
 }
 
+/// `lseek(fd, offset, whence)`: `SEEK_SET`/`SEEK_CUR`/`SEEK_END` (0/1/2)
+/// have the same numbers as `FILE_BEGIN`/`FILE_CURRENT`/`FILE_END`. Other
+/// values (`SEEK_DATA`, `SEEK_HOLE`, garbage) are `-EINVAL`, like Linux
+/// without file-system support for them. `whence` is an `unsigned int`.
+fn lseek() -> String {
+    let mut s = prologue(&shim_name("lseek"));
+    s += &format!(
+        "    mov ebx, edx
+    cmp ebx, 2
+    ja .Ll2w_lseek_inval
+    movsxd rcx, edi
+    mov edx, {F_OPEN}
+    call __l2w_fd_lookup
+    test rax, rax
+    jz .Ll2w_lseek_badf
+    mov rcx, rax
+    mov rdx, rsi
+    lea r8, [rsp + 56]
+    mov r9d, ebx
+    call SetFilePointerEx
+    test eax, eax
+    jz .Ll2w_lseek_err
+    mov rax, qword ptr [rsp + 56]
+    jmp .Ll2w_lseek_done
+.Ll2w_lseek_err:
+    call __l2w_errno
+    jmp .Ll2w_lseek_done
+.Ll2w_lseek_badf:
+    mov rax, -{EBADF}
+    jmp .Ll2w_lseek_done
+.Ll2w_lseek_inval:
+    mov rax, -{EINVAL}
+"
+    );
+    s + &epilogue(".Ll2w_lseek_done")
+}
+
 fn getpid() -> String {
     prologue(&shim_name("getpid"))
         + "    call GetCurrentProcessId\n    mov eax, eax\n"
@@ -428,9 +474,7 @@ pub const WIN32_IMPORTS: &[&str] = &[
 
 /// The runtime functions needed for the given shims, as `(name, source)`.
 pub fn runtime_code(keys: &[&str]) -> Vec<(String, String)> {
-    let uses_fds = keys
-        .iter()
-        .any(|k| matches!(*k, "read" | "write" | "open" | "close"));
+    let uses_fds = keys.iter().any(|k| uses_fd_table(k));
     let mut out: Vec<(String, String)> = keys
         .iter()
         .map(|&k| {
@@ -438,6 +482,7 @@ pub fn runtime_code(keys: &[&str]) -> Vec<(String, String)> {
                 "read" | "write" => read_write(k),
                 "open" => open(),
                 "close" => close(),
+                "lseek" => lseek(),
                 "getpid" => getpid(),
                 "exit" => exit(),
                 other => unreachable!("no shim for {other}"),
@@ -454,11 +499,14 @@ pub fn runtime_code(keys: &[&str]) -> Vec<(String, String)> {
     out
 }
 
+/// Shims that work on the file-descriptor table.
+fn uses_fd_table(key: &str) -> bool {
+    matches!(key, "read" | "write" | "open" | "close" | "lseek")
+}
+
 /// The file-descriptor table (`.data`), if any shim needs it.
 pub fn runtime_data(keys: &[&str]) -> Option<String> {
-    let uses_fds = keys
-        .iter()
-        .any(|k| matches!(*k, "read" | "write" | "open" | "close"));
+    let uses_fds = keys.iter().any(|k| uses_fd_table(k));
     let std = F_OPEN | F_STD | F_LAZY | F_READ | F_WRITE;
     uses_fds.then(|| {
         format!(
@@ -479,12 +527,13 @@ mod tests {
         assert_eq!(linux_syscall_name(60), Some("exit"));
         assert_eq!(linux_syscall_name(9999), None);
         assert_eq!(shim_for(231).unwrap().key, "exit");
+        assert_eq!(shim_for(8).unwrap().win32, "SetFilePointerEx");
         assert!(shim_for(9).is_none());
     }
 
     #[test]
     fn runtime_snippets_are_valid_assembly() {
-        let keys = ["read", "write", "open", "close", "getpid", "exit"];
+        let keys = ["read", "write", "open", "close", "lseek", "getpid", "exit"];
         for (name, src) in runtime_code(&keys) {
             let p = crate::parser::parse(&src);
             assert!(!p.has_errors(), "{name}:\n{src}\n{:#?}", p.diagnostics);
@@ -507,5 +556,26 @@ mod tests {
         assert!(w.ends_with("pop r10\n    pop r9\n    pop r8\n    pop rdx\n    pop rbx\n    pop rbp\n    popfq\n    ret\n"));
         assert!(w.contains("call SetFilePointerEx"));
         assert!(!read_write("read").contains("SetFilePointerEx"));
+    }
+
+    #[test]
+    fn lseek_shim_needs_the_fd_table() {
+        let code = runtime_code(&["lseek"]);
+        let names: Vec<&str> = code.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["__l2w_sys_lseek", "__l2w_fd_lookup", "__l2w_errno"]);
+        assert!(runtime_data(&["lseek"]).is_some());
+        let src = &code[0].1;
+        assert!(
+            src.contains("cmp ebx, 2\n    ja .Ll2w_lseek_inval"),
+            "{src}"
+        );
+        assert!(
+            src.contains("lea r8, [rsp + 56]\n    mov r9d, ebx\n    call SetFilePointerEx"),
+            "{src}"
+        );
+        // -ESPIPE and -EINVAL (negative seek) come from the error routine.
+        let errno = errno_routine();
+        assert!(errno.contains("mov rax, -29\n    cmp ecx, 1\n"), "{errno}");
+        assert!(errno.contains("cmp ecx, 131\n"), "{errno}");
     }
 }
