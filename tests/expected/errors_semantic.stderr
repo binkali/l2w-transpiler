@@ -20,7 +20,7 @@ error: unsupported instruction `cpuid`
   |
 9 |     cpuid                       # unsupported instruction
   |     ^^^^^
-  = help: supported instructions: mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo jmp j<cc> call ret push pop pushfq popfq leave nop syscall
+  = help: supported instructions: mov movzx movsx movsxd lea add sub imul mul idiv div and or xor not neg inc dec cmp test shl/sal shr sar xchg cbw cwde cdqe cwd cdq cqo set<cc> cmov<cc> jmp j<cc> call ret push pop pushfq popfq leave nop syscall
 error: no local label `1:` before this reference (`1b`)
   --> examples/errors_semantic.s:10:5
    |
