@@ -366,29 +366,10 @@ impl Lowerer {
             return *c;
         }
         if visiting.len() > crate::ir::MAX_EQUATE_CHAIN as usize {
-            let span = self
-                .module
-                .symbols
-                .get(name)
-                .and_then(|s| s.def_span)
-                .unwrap_or_default();
-            self.error(
-                format!(
-                    "equate `{name}` ends a chain of more than {} equates defined in terms of each other",
-                    crate::ir::MAX_EQUATE_CHAIN
-                ),
-                span,
-            );
-            memo.insert(name.to_string(), (ValueClass::Unknown, u32::MAX));
-            return ValueClass::Unknown;
+            return self.chain_too_long(name, memo);
         }
         if visiting.iter().any(|v| v == name) {
-            let span = self
-                .module
-                .symbols
-                .get(name)
-                .and_then(|s| s.def_span)
-                .unwrap_or_default();
+            let span = self.def_span(name);
             self.error(
                 format!("equate `{name}` is defined in terms of itself"),
                 span,
@@ -412,24 +393,38 @@ impl Lowerer {
             .unwrap_or(0)
             .saturating_add(1);
         if depth > crate::ir::MAX_EQUATE_CHAIN && depth != u32::MAX {
-            let span = self
-                .module
-                .symbols
-                .get(name)
-                .and_then(|s| s.def_span)
-                .unwrap_or_default();
-            self.error(
-                format!(
-                    "equate `{name}` ends a chain of more than {} equates defined in terms of each other",
-                    crate::ir::MAX_EQUATE_CHAIN
-                ),
-                span,
-            );
-            memo.insert(name.to_string(), (ValueClass::Unknown, u32::MAX));
-            return ValueClass::Unknown;
+            return self.chain_too_long(name, memo);
         }
         memo.insert(name.to_string(), (c, depth));
         c
+    }
+
+    fn def_span(&self, name: &str) -> Span {
+        self.module
+            .symbols
+            .get(name)
+            .and_then(|s| s.def_span)
+            .unwrap_or_default()
+    }
+
+    /// Reports an equate chain longer than [`crate::ir::MAX_EQUATE_CHAIN`]
+    /// and marks `name` as unresolvable (depth `u32::MAX`) so the error is
+    /// reported once per chain.
+    fn chain_too_long(
+        &mut self,
+        name: &str,
+        memo: &mut HashMap<String, (ValueClass, u32)>,
+    ) -> ValueClass {
+        let span = self.def_span(name);
+        self.error(
+            format!(
+                "equate `{name}` ends a chain of more than {} equates defined in terms of each other",
+                crate::ir::MAX_EQUATE_CHAIN
+            ),
+            span,
+        );
+        memo.insert(name.to_string(), (ValueClass::Unknown, u32::MAX));
+        ValueClass::Unknown
     }
 
     fn expr_class(
@@ -1360,6 +1355,36 @@ fn validate(
             }
             Some(unify(m, ops, &[0, 1], span)?)
         }
+        Setcc(_) => {
+            arity(m, ops, &[1], span)?;
+            require_rm(m, &ops[0])?;
+            default_mem_size(&mut ops[0], Size::Byte);
+            let size = unify(m, ops, &[0], span)?;
+            if size != Size::Byte {
+                return Err(err(
+                    format!(
+                        "`{}` needs an 8-bit operand, found {}",
+                        m.name(),
+                        size_desc(size)
+                    ),
+                    ops[0].span,
+                )
+                .with_help("write e.g. `sete al` and widen the result with `movzx eax, al`"));
+            }
+            Some(Size::Byte)
+        }
+        Cmovcc(_) => {
+            arity(m, ops, &[2], span)?;
+            let dst = require_reg(m, &ops[0])?;
+            if dst.size == Size::Byte {
+                return Err(err(
+                    format!("`{}` cannot use 8-bit registers", m.name()),
+                    ops[0].span,
+                ));
+            }
+            require_rm(m, &ops[1])?;
+            Some(unify(m, ops, &[0, 1], span)?)
+        }
         Push | Pop => {
             arity(m, ops, &[1], span)?;
             match &ops[0].op {
@@ -1622,6 +1647,39 @@ mod tests {
         assert_eq!(d.message, "unsupported instruction `cpuid`");
         assert_eq!(d.span, Some(Span::new(2, 3, 5)));
         assert!(d.help[0].contains("supported instructions"));
+    }
+
+    #[test]
+    fn setcc_and_cmovcc_forms() {
+        let m = lower_ok(
+            "cmp rdi, rsi\nsete al\nsetnz [rdx]\nsetnbe byte ptr [rdx + 1]\nsetg r9b\n\
+             cmovl eax, esi\ncmovnge rax, [rdx]\ncmovz cx, dx\n",
+        );
+        let listing: Vec<String> = instrs(&m).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            listing[1..],
+            [
+                "sete al",
+                "setne byte ptr [rdx]",
+                "seta byte ptr [rdx + 1]",
+                "setg r9b",
+                "cmovl eax, esi",
+                "cmovl rax, qword ptr [rdx]",
+                "cmove cx, dx",
+            ]
+        );
+        assert_eq!(instrs(&m)[1].size, Some(Size::Byte));
+        assert_eq!(instrs(&m)[6].size, Some(Size::Qword));
+        assert!(first_error("sete eax").contains("needs an 8-bit operand"));
+        assert!(first_error("sete word ptr [rax]").contains("needs an 8-bit operand"));
+        assert!(first_error("sete 1").contains("register or memory operand"));
+        assert!(first_error("sete al, bl").contains("expects 1 operand"));
+        assert!(first_error("cmove al, bl").contains("cannot use 8-bit registers"));
+        assert!(first_error("cmove eax, 1").contains("register or memory operand"));
+        assert!(first_error("cmove [rax], ebx").contains("general-purpose register"));
+        assert!(first_error("cmove rax, ebx").contains("size mismatch"));
+        assert!(first_error("setx al").contains("unsupported instruction `setx`"));
+        assert!(first_error("cmov eax, ebx").contains("unsupported instruction `cmov`"));
     }
 
     #[test]
