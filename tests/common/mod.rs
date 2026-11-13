@@ -6,12 +6,57 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+/// Standard output of `tool arg`, if the tool runs and succeeds.
+fn tool_output(tool: &str, arg: &str) -> Option<String> {
+    let out = Command::new(tool).arg(arg).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+pub fn available(tool: &str) -> bool {
+    tool_output(tool, "--version").is_some()
+}
+
+/// Candidate names for GNU `as` / `objdump` targeting x86-64 ELF: the
+/// native tools on Linux, or cross binutils elsewhere (Homebrew's
+/// `x86_64-elf-binutils` on macOS, `binutils-x86-64-linux-gnu` on Debian).
+pub const GNU_AS: &[&str] = &["as", "x86_64-linux-gnu-as", "x86_64-elf-as"];
+pub const GNU_OBJDUMP: &[&str] = &["objdump", "x86_64-linux-gnu-objdump", "x86_64-elf-objdump"];
+
+/// The first of `candidates` that is a GNU binutils tool. Existence is not
+/// enough: on macOS `as` and `objdump` are LLVM tools that accept neither
+/// `--64` nor GAS directives such as `.intel_syntax noprefix`.
+pub fn gnu_tool(candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|c| tool_output(c, "--version").is_some_and(|v| v.starts_with("GNU")))
+        .map(|c| c.to_string())
+}
+
+/// A C compiler that *targets* x86-64 Linux (its `-dumpmachine` says so),
+/// native or cross. Apple clang behind the name `gcc` is not one: it emits
+/// Mach-O assembly that l2w does not accept.
+pub fn linux_target_gcc() -> Option<String> {
+    ["gcc", "x86_64-linux-gnu-gcc"]
+        .into_iter()
+        .find(|c| {
+            tool_output(c, "-dumpmachine")
+                .is_some_and(|m| m.starts_with("x86_64") && m.contains("linux"))
+        })
+        .map(str::to_string)
+}
+
+/// A C compiler whose executables run on this host, which must be x86-64
+/// Linux: the behavioral tests build and *run* the original Linux program.
+pub fn linux_gcc() -> Option<String> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return None;
+    }
+    linux_target_gcc()
+}
+
+pub const LINUX_HOST_HINT: &str = "needs an x86-64 Linux host with gcc";
 
 pub fn dir() -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("windows");
@@ -128,6 +173,7 @@ static uint32_t win_error(int e) {
     case ENOENT: return 2;      case EMFILE: return 4;   case EACCES: return 5;
     case EBADF: return 6;       case EEXIST: return 80;  case EINVAL: return 87;
     case EPIPE: return 109;     case ENOSPC: return 112; case ENAMETOOLONG: return 206;
+    case ESPIPE: return 1;      /* ERROR_INVALID_FUNCTION: seek on a pipe */
     default: return 31;
     }
 }
@@ -207,12 +253,12 @@ pub type Outcome = (String, i32);
 ///   `ABI = __attribute__((ms_abi))`, i.e. the external functions use the
 ///   Windows calling convention exactly as real Windows DLL functions would.
 ///
-/// Returns `None` if gcc is not available.
+/// Returns `None` unless this is an x86-64 Linux host with gcc.
 pub fn linux_and_windows(name: &str, asm: &str, c_ext: &str) -> Option<(Outcome, Outcome)> {
-    if !available("gcc") {
-        eprintln!("skipping {name}: gcc not available");
+    let Some(gcc) = linux_gcc() else {
+        eprintln!("skipping {name}: {LINUX_HOST_HINT}");
         return None;
-    }
+    };
     let d = dir().join("spec").join(name);
     std::fs::create_dir_all(&d).unwrap();
     let ext = d.join("ext.c");
@@ -228,7 +274,7 @@ pub fn linux_and_windows(name: &str, asm: &str, c_ext: &str) -> Option<(Outcome,
     let orig_s = d.join("prog.s");
     std::fs::write(&orig_s, asm).unwrap();
     let orig = d.join("prog-linux");
-    run(Command::new("gcc")
+    run(Command::new(&gcc)
         .args([
             "-nostdlib",
             "-static",
@@ -251,7 +297,7 @@ pub fn linux_and_windows(name: &str, asm: &str, c_ext: &str) -> Option<(Outcome,
     )
     .unwrap();
     let tr = d.join("prog-win");
-    run(Command::new("gcc")
+    run(Command::new(&gcc)
         .args(["-no-pie", "-DWIN", "-DABI=__attribute__((ms_abi))"])
         .args(cflags)
         .arg("-o")
