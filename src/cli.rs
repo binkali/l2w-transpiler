@@ -15,7 +15,7 @@ pub const USAGE: &str = "\
 l2w - Linux-to-Windows x86-64 assembly transpiler
 
 USAGE:
-    l2w <INPUT> [OPTIONS]
+    ./target/release/l2w <INPUT> [OPTIONS]
 
 ARGS:
     <INPUT>                 Linux x86-64 assembly (GAS, .intel_syntax noprefix)
